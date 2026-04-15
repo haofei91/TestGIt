@@ -428,19 +428,51 @@ droidrun run "指令" --debug
 
 ---
 
-## 12. 方案选型
+## 12. 方案选型（全项目对比）
 
 | 你的情况 | 推荐方案 | 原因 |
 |----------|----------|------|
 | 需要独立运行的 Agent | **Droidrun** | 内置完整 Agent Loop，不依赖 MCP 客户端 |
 | 给 Claude/Cursor 提供设备工具 | **android-mcp-server / mobile-mcp** | 标准 MCP 服务器，IDE 直接集成 |
+| 全平台 MCP + 高级特性 | **claude-in-mobile** | 5 平台 + Flow 引擎 + 130+ 别名容错 |
 | 需要反检测 / Stealth | **Droidrun** | Bezier 曲线滑动 + 随机延迟 |
 | 需要操作回放 / 自动化脚本 | **Droidrun** | Macro 录制+回放 |
 | 极简部署（不装额外 App） | **android-mcp-server** | 一行 npx 启动，零设备修改 |
+| Android + Selector 查找 | **Android-MCP (CursorTouch)** | u2 原生 Selector + WaitForElement |
 | 已有 Appium 设施 | **appium-mcp** | 复用 Appium 生态 |
 | 需要自定义视觉模型 | **Open-AutoGLM** | 内置 AutoGLM-Phone-9B |
+| 学术研究 + 自动化学习 | **AppAgent** | UI 文档自动生成 + 探索-利用两阶段 |
 | 企业级可观测需求 | **Droidrun** | Phoenix + Langfuse + PostHog |
 | 不同 Agent 用不同 LLM | **Droidrun** | Manager/Executor/FastAgent 独立 LLM 配置 |
+| LLM 调用工具名容错 | **claude-in-mobile** | 130+ 别名映射，容忍 LLM 命名偏差 |
+| 应用商店上传集成 | **claude-in-mobile** | Google Play / Huawei / RuStore |
+| 跨平台最广 | **claude-in-mobile** | Android + iOS + Desktop + Aurora + Browser |
+
+### Droidrun vs claude-in-mobile 核心差异
+
+| 维度 | Droidrun | claude-in-mobile |
+|------|----------|-----------------|
+| 定位 | 自主 Agent（内置 LLM 推理） | MCP 工具服务器（由 Client 驱动） |
+| 平台 | Android + iOS | 5 平台 |
+| 独立运行 | 可以（CLI/TUI/SDK） | 不行（需要 MCP Client） |
+| Stealth 模式 | Bezier 曲线 + 随机延迟 | 无 |
+| 别名容错 | 无 | 130+ 别名 |
+| UI 分析 | Portal Accessibility（质量更高） | 正则解析 + 模糊匹配 + diff |
+| 可观测性 | Phoenix + Langfuse + PostHog | 无 |
+| 应用商店 | 无 | Play/Huawei/RuStore |
+
+### Droidrun vs AppAgent 核心差异
+
+| 维度 | Droidrun | AppAgent |
+|------|----------|----------|
+| 定位 | 工程化 Agent 框架 | 学术研究原型 |
+| Agent 模式 | Manager/Executor/FastAgent | 探索-利用两阶段 |
+| 学习能力 | 无（每次从零） | UI 文档积累 |
+| 设备通信 | ADB + Portal | 直接 ADB |
+| 多 LLM | 6+ 供应商 | GPT-4V / Qwen-VL |
+| Stealth | Bezier 曲线 | 无 |
+| 可观测性 | 完整 | 无 |
+| 工程化 | PyPI 包 + CLI + TUI | 学术脚本 |
 
 ---
 

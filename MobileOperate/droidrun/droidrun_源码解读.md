@@ -431,19 +431,19 @@ registry.disable_unsupported(capabilities)
 
 ---
 
-## 7. 与 mobile-mcp、android-mcp-server、appium-mcp、Open-AutoGLM 的对比
+## 7. 与 mobile-mcp、android-mcp-server、appium-mcp、Open-AutoGLM、Android-MCP、claude-in-mobile、AppAgent 的对比
 
 ### 7.1 架构本质对比
 
-| 维度 | Droidrun | mobile-mcp | android-mcp-server | appium-mcp | Open-AutoGLM |
-|------|----------|------------|-------------------|------------|--------------|
-| **本质** | 自主 Agent 框架 | MCP 工具服务器 | MCP 工具服务器 | MCP 工具服务器 | 自主 Agent |
-| **LLM 集成** | 内置（LlamaIndex） | 无（由 MCP 客户端提供） | 无 | 无 | 内置（AutoGLM-Phone-9B） |
-| **Agent Loop** | 内置（Manager/Executor/FastAgent） | 无 | 无 | 无 | 内置（Step Loop） |
-| **语言** | Python | TypeScript | TypeScript | Python | Python |
-| **平台** | Android + iOS | Android + iOS | Android Only | Android + iOS | Android + HarmonyOS + iOS |
-| **设备通信** | ADB + Portal App | 直连 ADB + iOS 工具链 | 直连 ADB | Appium Server | 直连 ADB + WDA + HDC |
-| **中间层** | Portal App (Accessibility) | 无 | 无 | Appium Server | 无 |
+| 维度 | Droidrun | mobile-mcp | android-mcp-server | appium-mcp | Open-AutoGLM | Android-MCP (CursorTouch) | claude-in-mobile | AppAgent |
+|------|----------|------------|-------------------|------------|--------------|--------------------------|-----------------|----------|
+| **本质** | 自主 Agent 框架 | MCP 工具服务器 | MCP 工具服务器 | MCP 工具服务器 | 自主 Agent | MCP 工具服务器 | MCP 工具服务器 | 自治 Agent (学术) |
+| **LLM 集成** | 内置（LlamaIndex） | 无 | 无 | 无 | 内置（AutoGLM） | 无 | 无 | 内置（GPT-4V/Qwen-VL） |
+| **Agent Loop** | Manager/Executor/FastAgent | 无 | 无 | 无 | Step Loop | 无 | Flow 引擎 (有限) | 探索-利用两阶段 |
+| **语言** | Python | TypeScript | TypeScript | Python | Python | Python | TypeScript | Python |
+| **平台** | Android + iOS | Android + iOS | Android | Android + iOS | Android + Harmony + iOS | Android | 5 平台 | Android |
+| **设备通信** | ADB + Portal | ADB + Maestro + idb | ADB | Appium | ADB + WDA + HDC | uiautomator2 | ADB + simctl + WDA + CDP | ADB |
+| **中间层** | Portal App | 无 | 无 | Appium Server | 无 | ATX Agent | 无 | 无 |
 
 ### 7.2 设备端需求对比
 
@@ -454,40 +454,53 @@ registry.disable_unsupported(capabilities)
 | **android-mcp-server** | 无 | 无 | 开发者选项 + ADB |
 | **appium-mcp** | 无（或 UiAutomator2） | Appium Server | 开发者选项 + ADB |
 | **Open-AutoGLM** | ADB Keyboard | VLM API | 开发者选项 + ADB |
+| **Android-MCP (CursorTouch)** | 无（自动安装 ATX Agent） | 无 | 开发者选项 + ADB |
+| **claude-in-mobile** | 无 | 无 | 开发者选项 + ADB |
+| **AppAgent** | 无 | GPT-4V / Qwen-VL API | 开发者选项 + ADB |
 
 ### 7.3 UI 分析能力对比
 
-| 维度 | Droidrun | android-mcp-server | Open-AutoGLM |
-|------|----------|-------------------|--------------|
-| **UI 树来源** | Portal Accessibility Service | `uiautomator dump` | 截图 + VLM 视觉理解 |
-| **UI 树质量** | 高（a11y_tree + phone_state + device_context） | 中（正则解析 XML） | N/A（纯视觉） |
-| **元素索引** | 有（IndexedFormatter） | 有（数组索引） | 无（坐标定位） |
-| **元素过滤** | 有（ConciseFilter / DetailedFilter） | 有（过滤无交互节点） | N/A |
-| **视觉分析** | 支持（截图 + LLM vision） | 支持（返回 base64 图片） | 核心方式 |
+| 维度 | Droidrun | android-mcp-server | Open-AutoGLM | Android-MCP (CursorTouch) | claude-in-mobile | AppAgent |
+|------|----------|-------------------|--------------|--------------------------|-----------------|----------|
+| **UI 树来源** | Portal Accessibility | `uiautomator dump` | 截图 + VLM | uiautomator2 XML | ADB uiautomator dump | ADB uiautomator dump |
+| **UI 树质量** | 高（a11y_tree + phone_state） | 中（正则解析） | N/A（纯视觉） | 高（u2 原生解析） | 中（正则解析 + 缓存） | 中（XML 解析 + 标注） |
+| **元素索引** | IndexedFormatter | 数组索引 | 无（坐标） | tabulate 表格 | 有（index + 缓存） | 数字标签 (SoM) |
+| **元素过滤** | ConciseFilter / DetailedFilter | 过滤无交互节点 | N/A | 8 属性交互性判断 | 多维筛选 (text/id/class) | 交互性过滤 |
+| **模糊匹配** | 无 | 无 | N/A | 无 (Selector 精确) | 有（评分 0-100） | 无 |
+| **UI Diff** | 无 | 无 | 无 | 无 | 有（60% 阈值） | 无 |
+| **屏幕分析** | 无 | 无 | VLM 理解 | 无 | 有（标题/对话框/导航） | GPT-4V 理解 |
+| **视觉分析** | 截图 + LLM vision | base64 图片 | 核心方式 | Pillow 标注截图 | diff + annotate | OpenCV 标注截图 |
 
 ### 7.4 核心技术对比
 
-| 特性 | Droidrun | mobile-mcp | android-mcp-server | appium-mcp | Open-AutoGLM |
-|------|----------|------------|-------------------|------------|--------------|
-| **持久化连接** | Portal TCP + ADB | 无 | Persistent Shell | Appium Session | 无 |
-| **截图压缩** | Portal 端处理 | 基础 | Sharp (1280px) | Appium 默认 | 无 |
-| **文本输入** | 专用键盘 App (支持中文) | ADB input | ADB input (不支持中文) | Appium API | ADB Keyboard (支持中文) |
-| **Stealth 模式** | Bezier 曲线 + 随机延迟 | 无 | 无 | 无 | 无 |
-| **轨迹录制** | 完整 (RecordingDriver) | 无 | 无 | 无 | 无 |
-| **Macro 回放** | 支持 | 无 | 无 | 无 | 无 |
-| **多 LLM** | 不同 Agent 可用不同 LLM | N/A | N/A | N/A | 固定 AutoGLM |
-| **可观测性** | Arize Phoenix + Langfuse + PostHog | 无 | 无 | 无 | 无 |
-| **MCP 客户端** | 可作为 MCP 客户端连接外部 MCP 工具 | 本身是 MCP 服务器 | 本身是 MCP 服务器 | 本身是 MCP 服务器 | 无 |
+| 特性 | Droidrun | mobile-mcp | android-mcp-server | appium-mcp | Open-AutoGLM | Android-MCP | claude-in-mobile | AppAgent |
+|------|----------|------------|-------------------|------------|--------------|-------------|-----------------|----------|
+| **持久化连接** | Portal TCP + ADB | 无 | Persistent Shell | Appium Session | 无 | u2 连接复用 | 无 | 无 |
+| **截图压缩** | Portal 端处理 | 基础 | Sharp (1280px) | Appium 默认 | 无 | 256 色量化 | jimp + diff | 无 |
+| **文本输入** | 专用键盘 (中文) | ADB input | ADB input | Appium API | ADB Keyboard | u2 send_keys | ADB input | ADB input |
+| **Stealth 模式** | Bezier + 随机延迟 | 无 | 无 | 无 | 无 | 无 | 无 | 无 |
+| **轨迹录制** | RecordingDriver | 无 | 无 | 无 | 无 | 无 | 无 | 无 |
+| **别名容错** | 无 | 无 | 无 | 无 | 无 | 无 | **130+ 别名** | 无 |
+| **Flow 引擎** | Agent Loop (内置) | 无 | 无 | 无 | Agent Loop | 无 | batch + run | Agent Loop |
+| **Selector** | 无 (index) | 无 | 无 | XPath/ID | 无 | **u2 Selector** | text/id/label | 无 |
+| **多 LLM** | 按 Agent 角色 | N/A | N/A | N/A | 固定 AutoGLM | N/A | N/A | GPT-4V/Qwen-VL |
+| **可观测性** | Phoenix + Langfuse | 无 | 无 | 无 | 无 | 无 | 无 | 无 |
+| **坐标缩放** | 无 | 无 | 无 | 无 | 无 | 无 | **自动修正** | 无 |
+| **UI 文档** | 无 | 无 | 无 | 无 | 无 | 无 | 无 | **自动生成** |
+| **应用商店** | 无 | 无 | 无 | 无 | 无 | 无 | **Play/Huawei/RuStore** | 无 |
 
 ### 7.5 代码规模对比
 
 | 项目 | 核心文件数 | 核心代码行数 | 复杂度 |
 |------|-----------|-------------|--------|
 | **Droidrun** | ~60+ | ~8000+ | 高（完整 Agent 框架） |
+| **claude-in-mobile** | ~75+ | ~8000+ | 高（全平台 MCP Server） |
 | **mobile-mcp** | ~10-15 | ~3000+ | 中 |
-| **android-mcp-server** | 2 | ~1200 | 低 |
-| **appium-mcp** | ~10 | ~2000+ | 中 |
 | **Open-AutoGLM** | ~15 | ~3000+ | 中 |
+| **appium-mcp** | ~10 | ~2000+ | 中 |
+| **android-mcp-server** | 2 | ~1200 | 低 |
+| **Android-MCP (CursorTouch)** | ~10 | ~700 | 低 |
+| **AppAgent** | ~10 | ~2000+ | 中（学术原型） |
 
 ### 7.6 适用场景建议
 
@@ -495,13 +508,19 @@ registry.disable_unsupported(capabilities)
 |------|----------|------|
 | 需要独立运行的 Agent（不依赖 MCP 客户端） | **Droidrun** | 内置完整 Agent Loop |
 | 需要 MCP 工具给 AI IDE 用 | **android-mcp-server / mobile-mcp** | 标准 MCP 服务器 |
+| 全平台 MCP + 高级特性 | **claude-in-mobile** | 5 平台 + Flow + 130+ 别名 |
 | 需要 Stealth / 反检测 | **Droidrun** | Bezier 曲线 + 随机延迟 |
 | 需要操作回放 / 自动化脚本 | **Droidrun** | Macro 录制+回放 |
 | 纯 Android、追求极简 | **android-mcp-server** | 一行 npx 启动 |
+| Android + Selector 查找 | **Android-MCP (CursorTouch)** | u2 原生 Selector，等待元素 |
 | 已有 Appium 设施 | **appium-mcp** | 复用 Appium 生态 |
 | 需要自定义 VLM | **Open-AutoGLM** | 内置 AutoGLM-Phone-9B |
+| 学术研究 + 自动化学习 | **AppAgent** | UI 文档 + 探索-利用两阶段 |
 | 跨 Android + iOS | **Droidrun / mobile-mcp** | 均支持双平台 |
 | 企业级可观测需求 | **Droidrun** | Phoenix + Langfuse + PostHog |
+| 应用商店上传集成 | **claude-in-mobile** | Play/Huawei/RuStore |
+| LLM 工具名容错 | **claude-in-mobile** | 130+ 别名映射 |
+| 不同 Agent 用不同 LLM | **Droidrun** | Manager/Executor/FastAgent 独立 LLM |
 | Benchmark 达标(91.4%) | **Droidrun** | 官方公布的 benchmark 成绩 |
 
 ---
