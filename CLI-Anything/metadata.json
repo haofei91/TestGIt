@@ -1,0 +1,26 @@
+{
+  "repo": "HKUDS/CLI-Anything",
+  "github_url": "https://github.com/HKUDS/CLI-Anything",
+  "local_path": "~/Documents/coding/github/CLI-Anything",
+  "stars": 22358,
+  "forks": 1990,
+  "language": "Python",
+  "license": "Apache License 2.0",
+  "description": "CLI-Anything: Making ALL Software Agent-Native",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-24",
+  "default_branch": "main",
+  "analysis_date": "2026-03-24",
+  "analysis_focus": "整体源码架构 + 7阶段流水线 + HARNESS.md 方法论",
+  "key_files": [
+    "cli-anything-plugin/HARNESS.md",
+    "cli-anything-plugin/repl_skin.py",
+    "cli-anything-plugin/commands/cli-anything.md",
+    "gimp/agent-harness/setup.py",
+    "gimp/agent-harness/cli_anything/gimp/gimp_cli.py"
+  ],
+  "output_docs": [
+    "CLI-Anything_源码解读.md",
+    "CLI-Anything_快速上手.md"
+  ]
+}
