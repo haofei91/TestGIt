@@ -238,75 +238,66 @@ program
 
 ---
 
-## 四、Harness 理念深度分析
+## 四、CLI 生成流程 — Verified Generation Harness
 
-OpenCLI 项目深度践行了 **Test Harness**、**Self-Repair Harness**、**AutoResearch Harness** 三层 Harness 架构。"Harness" 在这里不仅是测试框架的意思，更是一种 **"约束+度量+闭环"** 的工程理念。
+> **核心思想**: AI 生成的适配器不是"生成即完成"，而必须经过完整的 harness 流程才能注册为可用命令。
+>
+> OpenCLI 将 "Harness" 定义为 **"约束+度量+闭环"** 的工程理念。本章以用户生成 CLI 的完整路径为主线，逐一剖析每个 Phase 的实现。
 
-### 4.1 理念一：Diagnostic Harness（诊断线束）
-
-**核心思想**: 命令执行失败时，系统自动收集结构化诊断上下文，供 AI Agent 消费和修复。
-
-**实现**: `src/diagnostic.ts`
-
-```typescript
-// RepairContext 是核心数据契约
-interface RepairContext {
-  error:   { code, message, hint, stack }       // 结构化错误
-  adapter: { site, command, sourcePath, source } // 适配器元数据+源码
-  page:    { url, snapshot, networkRequests, capturedPayloads, consoleErrors } // 浏览器状态
-  timestamp: string
-}
-```
-
-**关键设计决策**:
-
-1. **安全边界先行**: 敏感数据（Authorization、Cookie、JWT、API Key）在输出前被 `redactUrl()` / `redactHeaders()` / `redactText()` 脱敏
-2. **大小预算控制**: DOM 快照限 100K 字符，源码限 50K，网络请求限 50 条，总输出限 256KB。超出预算时按优先级降级（先砍 snapshot → 砍 page）
-3. **带超时的收集**: `PAGE_STATE_TIMEOUT_MS = 5000`，防止 CDP 连接卡死导致诊断本身挂住
-4. **标记化输出**: 以 `___OPENCLI_DIAGNOSTIC___` 标记 JSON，方便任意 Agent 框架解析
-
-```
-命令失败 → execution.ts 捕获错误
-  → isDiagnosticEnabled() 检查环境变量
-  → collectDiagnostic() 并行收集页面状态
-  → emitDiagnostic() 脱敏+限制大小+输出 stderr
-```
-
-### 4.2 理念二：Self-Repair Harness（自修复线束）
-
-**核心思想**: 命令失败不是终点，Agent 应该 **自动诊断-修复-验证-上报**，形成闭环。
-
-**设计文档**: `designs/self-repair-protocol.md`  
-**实现载体**: `skills/opencli-autofix/SKILL.md`
-
-**关键原则**:
-
-> "The command itself is the spec." — 不需要预先编写 spec 文件，命令本身就是验证预言（verify oracle）
-
-**自修复协议**:
-
-```
-Agent 执行 opencli <site> <command>
-  → 成功 → 继续任务
-  → 失败 →
-    1. OPENCLI_DIAGNOSTIC=1 重新执行，收集 RepairContext
-    2. 从 RepairContext.adapter.sourcePath 读取适配器源码
-    3. 分析: error code + DOM snapshot + network requests → 定位根因
-    4. 编辑适配器文件
-    5. 重试命令
-    6. 仍然失败 → 重复（最多 3 轮）
-    7. 3 轮耗尽 → 上报失败
-```
-
-**作用域约束**: 只允许修改 `RepairContext.adapter.sourcePath` 指向的文件。绝不修改 `src/`、`extension/`、`tests/`、`package.json`。
-
-**非修复故障识别**: AUTH_REQUIRED / BROWSER_CONNECT / CAPTCHA / Rate Limit → 直接停止，不修改代码。
-
-### 4.3 理念三：Verified Generation Harness（验证生成线束）
-
-**核心思想**: AI 生成的适配器不是"生成即完成"，而必须经过 **探索→合成→候选→策略探测→验证→修复→注册** 的完整 harness 流程。
+### 4.1 全流程总览与设计合约
 
 **实现**: `src/generate-verified.ts`（973 行）
+
+用户通过一条命令即可完成全流程：
+
+```bash
+opencli generate <url> --goal <text> --site <name>
+```
+
+也可以分步执行：
+
+```bash
+opencli explore <url>                            # Phase 1
+opencli synthesize <site>                        # Phase 2
+opencli cascade <url>                            # Phase 3
+# Phase 4-6 由 generate 内部编排，无独立命令
+```
+
+**全流程编排图**:
+
+```
+opencli generate <url>
+  │
+  ├─ Phase 1: Explore ──────── exploreUrl()
+  │    → 浏览器打开页面，拦截网络请求，发现 JSON API endpoints
+  │    → 输出: endpoints[], capabilities[], 5 个 JSON artifacts
+  │    → [EarlyHint: api-surface-looks-viable / no-viable-api-surface]
+  │
+  ├─ Phase 2: Synthesize ───── synthesizeFromExplore()
+  │    → 从 explore 结果生成候选适配器 YAML
+  │    → 输出: candidates[]
+  │    → [EarlyHint: candidate-ready-for-verify / no-viable-candidate]
+  │
+  ├─ Phase 3: Cascade Probe ── cascadeProbe()
+  │    → 在同一浏览器会话内探测最简可行认证策略
+  │    → PUBLIC → COOKIE → HEADER 逐级降级
+  │    → 输出: bestStrategy + confidence
+  │
+  ├─ Phase 4: Verify ────────── verifyCandidate()
+  │    → 执行候选 pipeline，检查结果质量
+  │    → assessResult(): 非数组 / 空数组 / 字段过少 → 失败
+  │
+  ├─ Phase 4.5: Bounded Repair
+  │    → 首次验证失败且原因为 empty-result → 替换 itemPath 后重试一次
+  │
+  └─ Phase 5: Persist ────────── writeAdapter() + registerCommand()
+       → 成功 → 写入 ~/.opencli/clis/<site>/<name>.js + .meta.json
+       → 注册到 registry
+```
+
+**纯 CLI，零 Agent 依赖**: 整个流程是纯 TypeScript 代码，运行时零 LLM 消耗。Agent 的角色是**可选的**，仅在需要自修复（见 5.3）或自动化研究（见 6.1）时才介入。
+
+**record 命令 — Explore 的补充方案**: explore 是自动化的一次性快照，`opencli record <url>` 则是**持续录制**模式 — 打开浏览器后人工操作页面，CLI 每隔 `--poll` 毫秒轮询新的网络请求，`--timeout` 毫秒后自动停止，最终从录制的请求中生成候选适配器。
 
 #### v1 合约范围
 
@@ -326,159 +317,21 @@ Agent 执行 opencli <site> <command>
 4. taxonomy by skill decision needs — 分类按技能决策需求而非内部错误来源
 5. early hint / terminal outcome share consistent decision language — 统一决策语言
 
-#### 共享决策语言（Shared Decision Language）
+#### 三级输出分类
 
-`generate-verified.ts` 定义了一套**类型安全的决策语言**，贯穿整个 Harness 流程：
-
-```typescript
-// 终止原因（为什么 blocked）— 按技能决策需求分类
-type StopReason =
-  | 'no-viable-api-surface'              // 未发现 JSON API 端点
-  | 'auth-too-complex'                   // 认证超出 PUBLIC/COOKIE 范围
-  | 'no-viable-candidate'               // 候选存在但不达质量门槛
-  | 'execution-environment-unavailable'; // 浏览器/daemon 不可用
-
-// 升级原因（为什么 needs-human-check）— 面向行动命名
-type EscalationReason =
-  | 'empty-result'               // pipeline 执行但返回空
-  | 'sparse-fields'              // 结果字段过少
-  | 'non-array-result'           // 结果不是数组
-  | 'unsupported-required-args'  // 候选需要无法自动填充的参数
-  | 'timeout'                    // 执行超时
-  | 'selector-mismatch'         // DOM/JSON 路径不匹配
-  | 'verify-inconclusive';       // 歧义验证失败
-
-// 建议行动
-type SuggestedAction =
-  | 'stop'                    // 无更多可尝试
-  | 'inspect-with-browser'    // 人工用浏览器调试
-  | 'ask-for-login'           // 需要人工登录
-  | 'ask-for-sample-arg'      // 需要人工提供参数示例值
-  | 'manual-review';          // 通用人工审查
-
-// 可复用性分级
-type Reusability =
-  | 'verified-artifact'       // 完全验证，可直接使用
-  | 'unverified-candidate'    // 候选存在但未验证
-  | 'not-reusable';           // 无可保留内容
-```
-
-#### 纯 CLI 流程，零 Agent 依赖
-
-整个 Verified Generation Harness **完全通过 CLI 命令完成**，不需要 AI Agent 参与。`src/cli.ts` 中定义了三个核心命令：
-
-```bash
-# 一键完成全流程: explore → synthesize → verify → register
-opencli generate <url> --goal <text> --site <name>
-
-# 也可以分步执行：
-opencli explore <url>              # 第 1 步：浏览器探索，输出 JSON artifacts
-opencli synthesize <site>          # 第 2 步：从 explore 结果合成候选适配器
-opencli cascade <url> --pipeline <file>  # 第 3 步：策略探测
-```
-
-`opencli generate` 是上述步骤的编排器（`generateVerifiedFromUrl()`），在单个 CLI 调用中串联所有阶段。整个流程是**纯 TypeScript 代码**，运行时零 LLM 消耗：
-
-- Explore: 浏览器网络拦截 + 确定性规则分析（见 4.3.1）
-- Synthesize: 基于模板的 YAML 生成
-- Cascade: HTTP 请求逐级探测
-- Verify: 执行 pipeline + `assessResult()` 质量评估
-- Repair: 替换 `itemPath` 后重试（最多 1 次）
-
-Agent 的角色是**可选的**：仅在需要自修复（Self-Repair，见 4.2）或自动化研究（AutoResearch，见 4.5）时才介入。
-
-**Pipeline**:
-
-```
-Phase 1: Explore (exploreUrl)
-  → 打开页面，拦截网络请求，发现 JSON API endpoints
-  → 输出: endpoints[], capabilities[]
-
-Phase 2: Synthesize (synthesizeFromExplore)
-  → 从 explore 结果生成候选适配器 YAML
-  → 输出: candidates[]
-
-Phase 3: Select (selectCandidate)
-  → 根据 goal 选择最佳候选
-
-Phase 4: Cascade Probe (cascadeProbe)
-  → 在单个浏览器会话内探测最简可行策略
-  → PUBLIC → COOKIE → HEADER 逐级降级
-
-Phase 5: Verify (verifyCandidate)
-  → 执行候选 pipeline，检查结果质量
-  → assessResult(): 非数组 / 空数组 / 字段过少 → 失败
-
-Phase 5.5: Bounded Repair
-  → 首次验证失败且原因为 empty-result → 替换 itemPath 后重试一次
-
-Phase 6: Persist
-  → 成功 → 写入 ~/.opencli/clis/<site>/<name>.js + .meta.json
-  → 注册到 registry
-```
-
-**关键设计: 三级输出分类**:
-
-| 状态 | 含义 | 可复用性 |
+| 状态 | 含义 | 可复用性标记 |
 |------|------|---------|
 | `success` | 验证通过 | `verified-artifact` |
 | `needs-human-check` | 需人工检查 | `unverified-candidate` |
 | `blocked` | 无法继续 | `not-reusable` |
 
-**Early Hint 机制**: 在 explore/synthesize/cascade 每个阶段通过 `onEarlyHint` 回调提前通知调用方，实现成本门控（不适合的 URL 尽早退出，减少不必要的浏览器会话开销）。
+---
 
-```typescript
-// generate-verified.ts:83-104 — EarlyHint 接口
-type EarlyHintReason =
-  | 'api-surface-looks-viable'   // explore 发现可行的 API
-  | 'candidate-ready-for-verify' // 候选准备好验证
-  | 'no-viable-api-surface'      // 无可行 API → 建议停止
-  | 'auth-too-complex'           // 认证过于复杂 → 建议停止
-  | 'no-viable-candidate';       // 无可行候选 → 建议停止
+### 4.2 Phase 1: Explore — 9 步确定性 API 发现
 
-interface EarlyHint {
-  stage: 'explore' | 'synthesize' | 'cascade';
-  continue: boolean;        // 是否继续（false = 建议停止）
-  reason: EarlyHintReason;
-  confidence: 'high' | 'medium' | 'low';
-  candidate?: {             // 当前候选信息（如果有）
-    name: string;
-    command: string;
-    path: string | null;
-    reusability: 'unverified-candidate' | 'not-reusable';
-  };
-  message?: string;
-}
-```
+**实现**: `src/explore.ts`（516 行）+ `src/analysis.ts`（180 行）
 
-Early Hint 的设计原则是**纯门控**（pure gatekeeping）：它不做终端决策，终端决策由 `GenerateOutcome` 统一负责。Hint 与 Outcome 共享同一套决策语言，使 Agent/Skill 看到的是一条连续的决策路径。
-
-**终端输出契约（GenerateOutcome）**:
-
-```typescript
-interface GenerateOutcome {
-  status: 'success' | 'blocked' | 'needs-human-check';
-  adapter?: VerifiedAdapter;        // success 路径: 已验证的适配器
-  reason?: StopReason;              // blocked 路径: 停止原因
-  escalation?: EscalationContext;   // needs-human-check 路径: 升级上下文
-  reusability?: Reusability;        // 可复用性（success 和 needs-human-check 都有）
-  stats: GenerateStats;             // 统计信息
-  message?: string;                 // 人类可读摘要
-}
-
-interface GenerateStats {
-  endpoint_count: number;       // 发现的总端点数
-  api_endpoint_count: number;   // 其中 JSON API 端点数
-  candidate_count: number;      // 生成的候选数
-  verified: boolean;            // 是否通过验证
-  repair_attempted: boolean;    // 是否尝试过修复
-  explore_dir: string;          // explore 产物目录
-}
-```
-
-#### 4.3.1 Explore 机制详解（9 步确定性流程）
-
-Explore 是 Verified Generation 的第一阶段，负责从目标网页自动发现 API endpoints 和能力。整个实现位于 `src/explore.ts`（516 行）+ `src/analysis.ts`（180 行），**不依赖任何 LLM**，完全基于确定性规则。
+Explore 负责从目标网页自动发现 API endpoints 和能力。**不依赖任何 LLM**，完全基于确定性规则。
 
 **9 步探索流程**:
 
@@ -486,7 +339,7 @@ Explore 是 Verified Generation 的第一阶段，负责从目标网页自动发
 Step 1: Navigate + Network Capture
   → page.startNetworkCapture()  // 开始拦截网络请求
   → page.goto(url)               // 导航到目标 URL
-  → page.wait(waitSeconds)        // 等待页面初始加载
+  → page.wait(waitSeconds)        // 等待页面初始加载（默认 3s）
 
 Step 2: Auto-Scroll (懒加载触发)
   → page.autoScroll({ times: 3, delayMs: 1500 })
@@ -494,7 +347,7 @@ Step 2: Auto-Scroll (懒加载触发)
 
 Step 2.5: Interactive Fuzzing (仅 --auto 模式)
   → page.evaluate(INTERACT_FUZZ_JS)
-  → 详见 4.3.2 自动点击行为
+  → 详见 4.2.2 自动点击行为
 
 Step 3: Metadata Extraction
   → 从 document.title, meta[name=description] 等提取页面元数据
@@ -509,14 +362,7 @@ Step 5: iframe Re-Fetch (补全缺失的 JSON body)
 
 Step 6: Framework Detection
   → page.evaluate(FRAMEWORK_DETECT_JS)
-  → 通过 DOM/window 标记检测前端框架:
-    __vue__         → Vue 2
-    __vue_app__     → Vue 3
-    __REACT_DEVTOOLS_GLOBAL_HOOK__ → React
-    __NEXT_DATA__   → Next.js
-    __NUXT__        → Nuxt
-    $pinia          → Pinia
-    $store          → Vuex
+  → 通过 DOM/window 标记检测前端框架（详见 4.2.1）
 
 Step 7: Endpoint Analysis (确定性规则引擎)
   → analyzeEndpoints(networkEntries) — src/analysis.ts
@@ -552,7 +398,9 @@ Step 9: Write Artifacts (5 个 JSON 文件)
 - 所有分析规则都是**硬编码的确定性规则**（正则 + 关键词映射），不依赖 LLM
 - iframe re-fetch 是一个精巧的设计：SPA 应用通常会 monkey-patch `window.fetch`，但 iframe 中的 `contentWindow.fetch` 是原生的，能拿到真实的响应体
 
-**Endpoint 分析引擎源码** (`src/analysis.ts`, 180 行):
+#### 4.2.1 Endpoint 分析引擎源码
+
+`src/analysis.ts`（180 行）— 共享 API 分析助手，同时被 `explore.ts` 和 `record.ts` 使用：
 
 ```typescript
 // URL 模式化 — 将具体 ID 替换为占位符
@@ -608,6 +456,13 @@ export function classifyQueryParams(url: string): {
   hasPagination: boolean; // page/offset/cursor 等 → true
   hasLimit: boolean;      // limit/pageSize/count 等 → true
 }
+
+// 策略推导
+export function inferStrategy(authIndicators: string[]): string {
+  // signature → 'intercept'
+  // bearer/csrf → 'header'
+  // 其他 → 'cookie'
+}
 ```
 
 **框架检测脚本** (`src/scripts/framework.ts`, 40 行):
@@ -629,7 +484,7 @@ export function detectFramework() {
 }
 ```
 
-#### 4.3.2 自动点击行为与安全约束
+#### 4.2.2 自动点击行为与安全约束
 
 Explore 阶段对页面元素的点击操作**默认关闭**，仅在显式指定选项时启用。共有三种模式：
 
@@ -691,11 +546,37 @@ opencli explore <url> --click "热门,推荐,排行"
 
 **点击的目的**: 不是为了"浏览页面"，而是为了**触发更多 API 请求**。许多 SPA 页面的数据接口只有在点击特定 Tab 或按钮后才会被调用。通过有限度的点击，Explore 能发现更多隐藏的 API endpoints。
 
-### 4.4 理念四：Strategy Cascade Harness（策略级联线束）
+---
 
-**核心思想**: 自动发现最小权限策略，不需要人工指定。
+### 4.3 Phase 2: Synthesize — 模板化候选生成
+
+**实现**: `src/synthesize.ts`
+
+从 Explore 阶段写入的 5 个 JSON artifacts 中读取数据，生成候选适配器 YAML：
+
+```
+读取 .opencli/explore/<site>/endpoints.json
+  → 过滤: 只保留有 arrayPath 的端点（即返回列表数据的 API）
+  → 排序: 按数组长度降序
+  → 截取: 取 top N 个（默认 3）
+  → 对每个端点生成 YAML pipeline:
+      fetch: <url>
+      select: <arrayPath>
+      map: { <fieldRole>: <fieldPath>, ... }
+  → 输出: CandidateYaml[]
+```
+
+接下来 `selectCandidate()` 根据用户提供的 `--goal` 从候选中选择最佳匹配。如果用户未指定 goal，默认选第一个（数据量最大的）。
+
+**与 record 的关系**: synthesize 既可以消费 explore 的产物，也可以消费 record 的产物。两者输出格式相同（endpoints.json），synthesize 不关心数据来源。
+
+---
+
+### 4.4 Phase 3: Strategy Cascade — 5 级策略自动探测
 
 **实现**: `src/cascade.ts`（184 行）
+
+**核心思想**: 自动发现最小权限策略，不需要人工指定。
 
 **完整 5 级策略链**:
 
@@ -748,9 +629,331 @@ const maxIdx = CASCADE_ORDER.indexOf(Strategy.HEADER); // 默认最多探测到 
 
 **数据有效性判定**: `hasData` 不仅检查响应是否非空，还会检查中国站点常见的 API 错误码模式 — 如果 `json.code !== undefined && json.code !== 0`，则判定为无有效数据。
 
-置信度评分: 越简单的策略成功时置信度越高 (1.0 - index * 0.1)。
+**与 Explore 中认证检测的关系**: Explore 通过 `detectAuthFromHeaders()` 检测请求头中的认证特征并写入 `auth.json`，Cascade 则在运行时实际发送请求来验证哪种策略真正可行。两者互补：Explore 是静态推断，Cascade 是动态验证。
 
-### 4.5 理念五：AutoResearch Harness（自动化研究线束）
+---
+
+### 4.5 Phase 4-5: Verify & Bounded Repair — 质量评估与修复
+
+**验证阶段**:
+
+将 Cascade 确定的策略写入候选 YAML，然后通过 Pipeline 引擎实际执行：
+
+```
+verifyCandidate():
+  1. 将 bestStrategy 注入候选 pipeline
+  2. executePipeline(candidate) — 使用 src/pipeline/ 引擎执行
+  3. assessResult(output):
+     - 非数组 → 失败 (non-array-result)
+     - 空数组 → 失败 (empty-result)
+     - 字段过少 → 失败 (sparse-fields)
+     - 通过 → success
+```
+
+**有界修复（Bounded Repair）**:
+
+首次验证失败且原因为 `empty-result` 时，系统会尝试**一次**自动修复：
+
+```
+Verify 失败 (empty-result)
+  → 检查是否有备选 itemPath
+  → 替换 pipeline 中的 select 路径
+  → 重新执行 pipeline
+  → 再次 assessResult()
+  → 成功 → 继续 Persist
+  → 仍然失败 → 输出 needs-human-check
+```
+
+修复预算严格限定为 **1 次 itemPath 替换**，不做更复杂的修改。这是 v1 合约的设计约束。
+
+---
+
+### 4.6 Phase 6: Persist & Register — 产物持久化
+
+验证通过后，将候选转化为可执行适配器：
+
+```
+writeAdapter():
+  1. 将 YAML pipeline 编译为 .js 文件
+  2. 写入 ~/.opencli/clis/<site>/<name>.js
+  3. 生成 .meta.json sidecar 元数据文件:
+     {
+       generated_at: ISO timestamp,
+       source_url: 原始 URL,
+       strategy: 使用的认证策略,
+       explore_dir: explore 产物路径,
+       verified: true/false,
+       repair_attempted: true/false
+     }
+  4. registerCommand() → 注册到内存中的 registry
+  5. 下次启动时，discoverClis(USER) 会从 ~/.opencli/clis/ 发现并加载
+```
+
+**`--no-register` 选项**: 只验证不注册，用于测试生成质量。
+
+---
+
+### 4.7 决策语言与契约体系
+
+`generate-verified.ts` 定义了一套**类型安全的决策语言**，贯穿 Phase 1-6 全流程：
+
+#### EarlyHint — 阶段间门控
+
+在 explore/synthesize/cascade 每个阶段通过 `onEarlyHint` 回调提前通知调用方，实现成本门控：
+
+```typescript
+// generate-verified.ts:83-104 — EarlyHint 接口
+type EarlyHintReason =
+  | 'api-surface-looks-viable'   // explore 发现可行的 API
+  | 'candidate-ready-for-verify' // 候选准备好验证
+  | 'no-viable-api-surface'      // 无可行 API → 建议停止
+  | 'auth-too-complex'           // 认证过于复杂 → 建议停止
+  | 'no-viable-candidate';       // 无可行候选 → 建议停止
+
+interface EarlyHint {
+  stage: 'explore' | 'synthesize' | 'cascade';
+  continue: boolean;        // 是否继续（false = 建议停止）
+  reason: EarlyHintReason;
+  confidence: 'high' | 'medium' | 'low';
+  candidate?: {             // 当前候选信息（如果有）
+    name: string;
+    command: string;
+    path: string | null;
+    reusability: 'unverified-candidate' | 'not-reusable';
+  };
+  message?: string;
+}
+```
+
+设计原则是**纯门控**（pure gatekeeping）：Hint 不做终端决策，终端决策由 `GenerateOutcome` 统一负责。Hint 与 Outcome 共享同一套决策语言，Agent/Skill 看到的是一条连续的决策路径。
+
+#### GenerateOutcome — 终端输出契约
+
+```typescript
+interface GenerateOutcome {
+  status: 'success' | 'blocked' | 'needs-human-check';
+  adapter?: VerifiedAdapter;        // success 路径: 已验证的适配器
+  reason?: StopReason;              // blocked 路径: 停止原因
+  escalation?: EscalationContext;   // needs-human-check 路径: 升级上下文
+  reusability?: Reusability;        // 可复用性（success 和 needs-human-check 都有）
+  stats: GenerateStats;             // 统计信息
+  message?: string;                 // 人类可读摘要
+}
+
+interface GenerateStats {
+  endpoint_count: number;       // 发现的总端点数
+  api_endpoint_count: number;   // 其中 JSON API 端点数
+  candidate_count: number;      // 生成的候选数
+  verified: boolean;            // 是否通过验证
+  repair_attempted: boolean;    // 是否尝试过修复
+  explore_dir: string;          // explore 产物目录
+}
+```
+
+#### 决策分类类型
+
+```typescript
+// 终止原因（为什么 blocked）— 按技能决策需求分类
+type StopReason =
+  | 'no-viable-api-surface'              // 未发现 JSON API 端点
+  | 'auth-too-complex'                   // 认证超出 PUBLIC/COOKIE 范围
+  | 'no-viable-candidate'               // 候选存在但不达质量门槛
+  | 'execution-environment-unavailable'; // 浏览器/daemon 不可用
+
+// 升级原因（为什么 needs-human-check）— 面向行动命名
+type EscalationReason =
+  | 'empty-result'               // pipeline 执行但返回空
+  | 'sparse-fields'              // 结果字段过少
+  | 'non-array-result'           // 结果不是数组
+  | 'unsupported-required-args'  // 候选需要无法自动填充的参数
+  | 'timeout'                    // 执行超时
+  | 'selector-mismatch'         // DOM/JSON 路径不匹配
+  | 'verify-inconclusive';       // 歧义验证失败
+
+// 建议行动
+type SuggestedAction =
+  | 'stop'                    // 无更多可尝试
+  | 'inspect-with-browser'    // 人工用浏览器调试
+  | 'ask-for-login'           // 需要人工登录
+  | 'ask-for-sample-arg'      // 需要人工提供参数示例值
+  | 'manual-review';          // 通用人工审查
+
+// 可复用性分级
+type Reusability =
+  | 'verified-artifact'       // 完全验证，可直接使用
+  | 'unverified-candidate'    // 候选存在但未验证
+  | 'not-reusable';           // 无可保留内容
+```
+
+---
+
+## 五、CLI 运行时技术点
+
+> 适配器生成并注册后，用户通过 `opencli <site> <command>` 运行 CLI。本章分析命令执行过程中涉及的运行时 Harness。
+
+### 5.1 Lifecycle Hook Harness（生命周期钩子线束）
+
+**实现**: `src/hooks.ts`（92 行）
+
+**核心思想**: 插件可以接入命令执行的关键节点，实现横切关注点（如遥测、缓存预热、更新检查等）。
+
+**globalThis 单例模式**:
+
+与 `registry.ts` 相同，hooks 使用 `globalThis.__opencli_hooks__` 保证跨模块单例。这是因为 TS 插件通过 npm link / peerDependency 符号链接加载时，可能存在多份模块拷贝，`globalThis` 确保所有拷贝共享同一个 hook store：
+
+```typescript
+// hooks.ts:36-41 — globalThis 单例保证
+declare global {
+  var __opencli_hooks__: Map<HookName, HookFn[]> | undefined;
+}
+const _hooks: Map<HookName, HookFn[]> =
+  globalThis.__opencli_hooks__ ??= new Map();
+```
+
+**HookContext 接口**:
+
+```typescript
+interface HookContext {
+  command: string;                  // "site/name" 格式，或 "__startup__"
+  args: Record<string, unknown>;    // 已校验的参数
+  startedAt?: number;               // 执行开始时间 (epoch ms)
+  finishedAt?: number;              // 执行结束时间 (epoch ms)
+  error?: unknown;                  // 命令抛出的错误
+  [key: string]: unknown;           // 插件可附加任意数据用于跨钩子通信
+}
+```
+
+**三个生命周期钩子点**:
+
+```
+onStartup       → 所有命令和插件发现完成后（仅一次）
+onBeforeExecute  → 每次命令执行前
+onAfterExecute   → 每次命令执行后（携带结果/错误）
+```
+
+**隔离保证**: 每个 handler 用 try/catch 包裹，一个钩子失败不会阻塞命令执行：
+
+```typescript
+// hooks.ts:73-84 — 钩子发射（隔离执行）
+export async function emitHook(name: HookName, ctx: HookContext, result?: unknown): Promise<void> {
+  for (const fn of handlers) {
+    try {
+      await fn(ctx, result);
+    } catch (err) {
+      log.warn(`Hook ${name} handler failed: ${err.message}`);
+      // 不抛出，不阻塞
+    }
+  }
+}
+```
+
+**测试支持**: `clearAllHooks()` 方法用于测试时重置全局 hook store。
+
+**执行引擎中的集成** (`src/execution.ts`):
+
+```
+用户调用 opencli <site> <command> <args>
+  → coerceAndValidateArgs()             // 参数校验
+  → emitHook('onBeforeExecute', ctx)    // 前置钩子
+  → shouldUseBrowserSession(cmd)         // 能力路由（见 3.8）
+    ├── 浏览器命令 → browserSession() → preNav → runWithTimeout → closeWindow
+    └── 非浏览器命令 → runCommand(cmd, null, kwargs)
+  → emitHook('onAfterExecute', ctx)     // 后置钩子
+```
+
+### 5.2 Diagnostic Harness（诊断线束）
+
+**核心思想**: 命令执行失败时，系统自动收集结构化诊断上下文，供 AI Agent 消费和修复。
+
+**实现**: `src/diagnostic.ts`
+
+```typescript
+// RepairContext 是核心数据契约
+interface RepairContext {
+  error:   { code, message, hint, stack }       // 结构化错误
+  adapter: { site, command, sourcePath, source } // 适配器元数据+源码
+  page:    { url, snapshot, networkRequests, capturedPayloads, consoleErrors } // 浏览器状态
+  timestamp: string
+}
+```
+
+**关键设计决策**:
+
+1. **安全边界先行**: 敏感数据（Authorization、Cookie、JWT、API Key）在输出前被 `redactUrl()` / `redactHeaders()` / `redactText()` 脱敏
+2. **大小预算控制**: DOM 快照限 100K 字符，源码限 50K，网络请求限 50 条，总输出限 256KB。超出预算时按优先级降级（先砍 snapshot → 砍 page）
+3. **带超时的收集**: `PAGE_STATE_TIMEOUT_MS = 5000`，防止 CDP 连接卡死导致诊断本身挂住
+4. **标记化输出**: 以 `___OPENCLI_DIAGNOSTIC___` 标记 JSON，方便任意 Agent 框架解析
+
+**触发流程**:
+
+```
+命令失败 → execution.ts 捕获错误
+  → isDiagnosticEnabled() 检查环境变量 OPENCLI_DIAGNOSTIC
+  → collectDiagnostic() 并行收集页面状态（带 5s 超时）
+  → emitDiagnostic() 脱敏 → 大小预算裁剪 → 输出到 stderr
+```
+
+### 5.3 Self-Repair Harness（自修复线束）
+
+**核心思想**: 命令失败不是终点，Agent 应该 **自动诊断-修复-验证-上报**，形成闭环。
+
+**设计文档**: `designs/self-repair-protocol.md`  
+**实现载体**: `skills/opencli-autofix/SKILL.md`
+
+**关键原则**:
+
+> "The command itself is the spec." — 不需要预先编写 spec 文件，命令本身就是验证预言（verify oracle）
+
+**自修复协议**:
+
+```
+Agent 执行 opencli <site> <command>
+  → 成功 → 继续任务
+  → 失败 →
+    1. OPENCLI_DIAGNOSTIC=1 重新执行，收集 RepairContext（见 5.2）
+    2. 从 RepairContext.adapter.sourcePath 读取适配器源码
+    3. 分析: error code + DOM snapshot + network requests → 定位根因
+    4. 编辑适配器文件
+    5. 重试命令
+    6. 仍然失败 → 重复（最多 3 轮）
+    7. 3 轮耗尽 → 上报失败
+```
+
+**作用域约束**: 只允许修改 `RepairContext.adapter.sourcePath` 指向的文件。绝不修改 `src/`、`extension/`、`tests/`、`package.json`。
+
+**非修复故障识别**: AUTH_REQUIRED / BROWSER_CONNECT / CAPTCHA / Rate Limit → 直接停止，不修改代码。这些是环境问题，修改适配器代码无法解决。
+
+**与 Verified Generation 的关系**: Verified Generation 内部的 Bounded Repair（4.5）是**自动化的、无 Agent 参与的、仅限 itemPath 替换**；Self-Repair 是**Agent 驱动的、可修改任意适配器代码的、最多 3 轮**。前者在生成阶段，后者在运行阶段。
+
+### 5.4 Validation Harness（校验线束）
+
+**实现**: `src/validate.ts` + `src/verify.ts`
+
+**核心思想**: 在运行前就发现问题，而非等到运行时报错。
+
+双层校验：
+
+1. **静态校验** (`validate`): 检查注册表中所有命令的定义完整性
+   - description 是否存在
+   - browser 命令是否有 domain
+   - pipeline 步骤名是否合法
+   - func/pipeline 是否至少有一个
+   - 参数名是否重复
+
+2. **运行时验证** (`verify`): 静态校验 + 可选的 smoke test（使用 vitest 运行 `tests/smoke/`）
+
+```bash
+opencli doctor          # 运行静态校验
+opencli doctor --verify # 运行静态校验 + smoke test
+```
+
+---
+
+## 六、持续改进
+
+> CLI 生成后，如何系统性地持续提升质量？本章介绍 OpenCLI 的自动化改进和测试保障体系。
+
+### 6.1 AutoResearch Harness（自动化研究线束）
 
 **核心思想**: 借鉴 Karpathy 的 autoresearch 理念 — 用 **约束（scope） + 机械度量（verify） + 无限循环（iteration）** 驱动 AI 自动改进代码。
 
@@ -787,9 +990,11 @@ Phase 8: Repeat     — 回到 Phase 1
 
 **卡住检测**: 当连续丢弃次数 > 5 时，提供递进式提示：重读 scope → 组合成功策略 → 反向思考 → 激进架构变更 → 简化。
 
-### 4.6 理念六：Testing Harness（测试线束）
+**与 Self-Repair 的区别**: Self-Repair 是"命令失败时的应急修复"（被动触发、最多 3 轮、修改单个适配器）；AutoResearch 是"主动的系统性改进"（主动触发、无限迭代、可修改 scope 内任何文件）。
 
-三层测试架构：
+### 6.2 Testing Harness（测试线束）
+
+四层测试架构：
 
 ```
 Unit Tests (src/**/*.test.ts)
@@ -810,82 +1015,16 @@ Smoke Tests (tests/smoke/*.test.ts)
 
 **CI 策略**: 单元测试分 2 shard 并行；E2E 使用真实 Chrome + xvfb-run；Smoke 定时调度运行。
 
-### 4.7 理念七：Lifecycle Hook Harness（生命周期钩子线束）
-
-**实现**: `src/hooks.ts`（92 行）
-
-**globalThis 单例模式**:
-
-与 `registry.ts` 相同，hooks 使用 `globalThis.__opencli_hooks__` 保证跨模块单例。这是因为 TS 插件通过 npm link / peerDependency 符号链接加载时，可能存在多份模块拷贝，`globalThis` 确保所有拷贝共享同一个 hook store：
-
-```typescript
-// hooks.ts:36-41 — globalThis 单例保证
-declare global {
-  var __opencli_hooks__: Map<HookName, HookFn[]> | undefined;
-}
-const _hooks: Map<HookName, HookFn[]> =
-  globalThis.__opencli_hooks__ ??= new Map();
-```
-
-**HookContext 接口**:
-
-```typescript
-interface HookContext {
-  command: string;                  // "site/name" 格式，或 "__startup__"
-  args: Record<string, unknown>;    // 已校验的参数
-  startedAt?: number;               // 执行开始时间 (epoch ms)
-  finishedAt?: number;              // 执行结束时间 (epoch ms)
-  error?: unknown;                  // 命令抛出的错误
-  [key: string]: unknown;           // 插件可附加任意数据用于跨钩子通信
-}
-```
-
-三个生命周期钩子点：
-
-```
-onStartup       → 所有命令和插件发现完成后
-onBeforeExecute  → 每次命令执行前
-onAfterExecute   → 每次命令执行后（携带结果/错误）
-```
-
-**隔离保证**: 每个 handler 用 try/catch 包裹，一个钩子失败不会阻塞命令执行：
-
-```typescript
-// hooks.ts:73-84 — 钩子发射（隔离执行）
-export async function emitHook(name: HookName, ctx: HookContext, result?: unknown): Promise<void> {
-  for (const fn of handlers) {
-    try {
-      await fn(ctx, result);
-    } catch (err) {
-      log.warn(`Hook ${name} handler failed: ${err.message}`);
-      // 不抛出，不阻塞
-    }
-  }
-}
-```
-
-**测试支持**: `clearAllHooks()` 方法用于测试时重置全局 hook store。
-
-### 4.8 理念八：Validation Harness（校验线束）
-
-**实现**: `src/validate.ts` + `src/verify.ts`
-
-双层校验：
-
-1. **静态校验** (`validate`): 检查注册表中所有命令的定义完整性
-   - description 是否存在
-   - browser 命令是否有 domain
-   - pipeline 步骤名是否合法
-   - func/pipeline 是否至少有一个
-   - 参数名是否重复
-
-2. **运行时验证** (`verify`): 静态校验 + 可选的 smoke test（使用 vitest 运行 `tests/smoke/`）
+**Testing 与其他 Harness 的配合**:
+- Validation Harness（5.4）是测试的前置门禁 — 静态校验不通过的命令不会进入 E2E
+- AutoResearch（6.1）的 `guard` 字段通常就是 `npm run build` 或 `npm test`
+- Verified Generation（4.5）的 `assessResult()` 本质上是一次内嵌的 smoke test
 
 ---
 
-## 五、设计思想总结
+## 七、Harness 理念的统一框架
 
-### 5.1 核心设计原则
+### 7.1 核心设计原则
 
 | 原则 | 体现 |
 |------|------|
@@ -901,9 +1040,7 @@ export async function emitHook(name: HookName, ctx: HookContext, result?: unknow
 | **统一决策语言** | Verified Generation 中 EarlyHint 和 GenerateOutcome 共享类型体系 |
 | **懒加载** | 命令模块按需 import()，CLI 管理命令按需 import()，极致冷启动 |
 
-### 5.2 Harness 理念的统一框架
-
-所有 Harness 都遵循一个统一的模式：
+### 7.2 所有 Harness 的统一模式
 
 ```
 约束（Constraint）→ 动作（Action）→ 度量（Metric）→ 决策（Decision）→ 闭环（Loop）
@@ -911,16 +1048,18 @@ export async function emitHook(name: HookName, ctx: HookContext, result?: unknow
 
 | Harness | 约束 | 动作 | 度量 | 决策 | 闭环 |
 |---------|------|------|------|------|------|
-| Diagnostic | 大小预算+脱敏 | 收集上下文 | RepairContext | 输出/丢弃 | 供 Agent 消费 |
-| Self-Repair | sourcePath+3轮上限 | 诊断+修复 | 重试是否成功 | keep/stop | 最多3轮 |
-| Verified Gen | PUBLIC/COOKIE 限定 | explore→verify | 结果质量评估 | success/blocked/escalate | 含1次修复重试 |
-| Cascade | 策略列表 | 逐级探测 | HTTP 响应状态 | 返回最佳策略 | 单次遍历 |
-| AutoResearch | scope glob | AI 修改+commit | verify 命令 | keep/discard | N 次迭代 |
+| Verified Gen | PUBLIC/COOKIE + v1 合约 | explore→cascade→verify | assessResult 质量评估 | success/blocked/escalate | 含 1 次 itemPath 修复 |
+| Cascade | 5 级策略列表 | 逐级 fetch 探测 | HTTP 响应状态 + hasData | 返回最佳策略 | 单次遍历 |
+| Diagnostic | 大小预算 + 脱敏 | 收集浏览器上下文 | RepairContext 完整性 | 输出/降级丢弃 | 供 Agent 消费 |
+| Self-Repair | sourcePath + 3 轮上限 | 诊断 + 修复适配器 | 重试是否成功 | keep/stop | 最多 3 轮 |
+| AutoResearch | scope glob | AI 原子变更 + commit | verify 命令数值 | keep/discard | N 次迭代 |
 | Validation | 命令定义 schema | 遍历注册表 | error/warning 计数 | PASS/FAIL | 单次 |
+| Testing | 四层测试 | 运行测试套件 | 通过率 | 绿/红 | CI 持续运行 |
+| Lifecycle Hook | try/catch 隔离 | 触发 handler | handler 返回值 | 继续/warn | 每次命令 |
 
 ---
 
-## 六、值得借鉴的点
+## 八、值得借鉴的点
 
 1. **结构化错误 + 可操作提示**: 每个错误类型都携带 `code`（机器读）、`hint`（人读修复建议）、`exitCode`（Unix 规范），使 AI Agent 和人类都能高效处理错误
 2. **Diagnostic as API**: 将诊断信息视为给 AI Agent 的 API 契约（`RepairContext`），而非给人看的日志
@@ -937,10 +1076,11 @@ export async function emitHook(name: HookName, ctx: HookContext, result?: unknow
 
 ---
 
-## 七、局限性
+## 九、局限性
 
 1. 浏览器适配器强依赖 Chrome 和 Browser Bridge 扩展，不支持 Firefox/Safari
 2. Pipeline 引擎不支持并行步骤或条件分支
 3. AutoResearch 的 `extractMetric()` 仅支持简单数字提取，复杂度量需自定义
 4. 站点反爬/地域限制是运行时的主要不确定性来源，E2E 测试采用 warn+pass 策略作为妥协
 5. Self-Repair 的 3 轮修复预算较保守，对于重大站点改版可能不够
+6. Verified Generation v1 合约仅覆盖 PUBLIC/COOKIE + read-only JSON API，HEADER/INTERCEPT/UI 策略和写操作需要人工编写适配器
