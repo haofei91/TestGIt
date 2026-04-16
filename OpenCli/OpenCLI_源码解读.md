@@ -297,6 +297,35 @@ opencli generate <url>
 
 **纯 CLI，零 Agent 依赖**: 整个流程是纯 TypeScript 代码，运行时零 LLM 消耗。Agent 的角色是**可选的**，仅在需要自修复（见 5.3）或自动化研究（见 6.1）时才介入。
 
+#### Agent 的角色
+
+Agent 不是必须的，但 OpenCLI 的设计是 **Agent-ready**：
+
+| 场景 | 需要 Agent？ | 说明 |
+|------|:---:|------|
+| `opencli generate` 成功 | 不需要 | CLI 自己完成全流程 |
+| `generate` 返回 `needs-human-check` | 可选 | Agent 可读取结构化输出，决定下一步 |
+| `generate` 返回 `blocked` | 可选 | Agent 可根据 `reason` 判断是否切换策略 |
+| 适配器运行时失败 | 需要 | Self-Repair（`opencli-autofix` skill）需要 Agent 来读诊断、改代码、重试（见 5.3） |
+| AutoResearch 迭代 | 需要 | `autoresearch/engine.ts` 的 `modify` 回调需要 Agent 来 ideate + 改代码（见 6.1） |
+
+**总结**: generate 的完整 harness 流程是**纯 CLI 内建**的，不依赖 Agent。Agent 的价值在于处理 **harness 失败后的恢复**（Self-Repair）和**持续优化**（AutoResearch），这是两个更高层级的 harness，它们构建在 CLI harness 之上。
+
+```
+层级关系:
+
+  ┌─────────────────────────────────────────┐
+  │   AutoResearch Harness (Agent 驱动)      │ ← 持续优化
+  │   ┌─────────────────────────────────┐   │
+  │   │ Self-Repair Harness (Agent 驱动) │   │ ← 失败恢复
+  │   │   ┌─────────────────────────┐   │   │
+  │   │   │ CLI Harness (纯 CLI)     │   │   │ ← 生成+运行
+  │   │   │ generate/explore/verify  │   │   │
+  │   │   └─────────────────────────┘   │   │
+  │   └─────────────────────────────────┘   │
+  └─────────────────────────────────────────┘
+```
+
 **record 命令 — Explore 的补充方案**: explore 是自动化的一次性快照，`opencli record <url>` 则是**持续录制**模式 — 打开浏览器后人工操作页面，CLI 每隔 `--poll` 毫秒轮询新的网络请求，`--timeout` 毫秒后自动停止，最终从录制的请求中生成候选适配器。
 
 #### v1 合约范围
@@ -331,185 +360,62 @@ opencli generate <url>
 
 **实现**: `src/explore.ts`（516 行）+ `src/analysis.ts`（180 行）
 
-Explore 负责从目标网页自动发现 API endpoints 和能力。**不依赖任何 LLM**，完全基于确定性规则。
+**核心原理**: 用真实浏览器当"探针"，**被动抓包 + 主动触发**，再用**确定性规则**分析抓到的数据。完全不依赖 Agent，不依赖 LLM，全部在 `exploreUrl()` 函数内完成。
 
-**9 步探索流程**:
+---
 
-```
-Step 1: Navigate + Network Capture
-  → page.startNetworkCapture()  // 开始拦截网络请求
-  → page.goto(url)               // 导航到目标 URL
-  → page.wait(waitSeconds)        // 等待页面初始加载（默认 3s）
-
-Step 2: Auto-Scroll (懒加载触发)
-  → page.autoScroll({ times: 3, delayMs: 1500 })
-  → 滚动 3 次，每次间隔 1.5s，触发所有 lazy-loading 和无限滚动
-
-Step 2.5: Interactive Fuzzing (仅 --auto 模式)
-  → page.evaluate(INTERACT_FUZZ_JS)
-  → 详见 4.2.2 自动点击行为
-
-Step 3: Metadata Extraction
-  → 从 document.title, meta[name=description] 等提取页面元数据
-
-Step 4: Network Harvest
-  → page.readNetworkCapture() ?? page.networkRequests(false)
-  → 收集所有网络请求（URL, method, status, headers, responseBody）
-
-Step 5: iframe Re-Fetch (补全缺失的 JSON body)
-  → 对响应体为空但 Content-Type 为 JSON 的请求，通过 iframe.contentWindow.fetch 重新请求
-  → 使用 iframe 而非直接 fetch，是为了绕过 SPA 框架对 window.fetch 的 monkey-patching
-
-Step 6: Framework Detection
-  → page.evaluate(FRAMEWORK_DETECT_JS)
-  → 通过 DOM/window 标记检测前端框架（详见 4.2.1）
-
-Step 7: Endpoint Analysis (确定性规则引擎)
-  → analyzeEndpoints(networkEntries) — src/analysis.ts
-  → 包含以下子步骤:
-    a. isNoiseUrl(): 过滤追踪/分析类 URL (google analytics, sentry, etc.)
-    b. urlToPattern(): URL 模式化 (数字→{id}, 16进制→{hex}, BV号→{bvid})
-    c. findArrayPath(): 在 JSON 响应中递归查找最大对象数组 (最深 5 层)
-    d. detectFieldRoles(): 字段名→语义角色映射 (title/name→title, img/avatar→image, etc.)
-    e. classifyQueryParams(): 参数分类 (keyword→search, page/offset→pagination, limit→limit)
-    f. detectAuthFromHeaders(): 从请求头检测认证方式 (bearer/csrf/signature)
-
-Step 8: Capability Inference
-  → inferCapabilitiesFromEndpoints(analyzed, stores, opts)
-  → 从 URL 关键词推导 CLI 能力名称:
-    hot/popular/trending → hot
-    search/query → search
-    recommend → recommend
-    detail/info → detail
-    ...
-
-Step 9: Write Artifacts (5 个 JSON 文件)
-  → writeExploreArtifacts(targetDir, result, analyzed, stores)
-  → 输出到 .opencli/explore/<site>/:
-    manifest.json     — 页面元数据 + 框架信息
-    endpoints.json    — 所有发现的 API endpoint 及其分析结果
-    capabilities.json — 推导出的 CLI 能力列表
-    auth.json         — 检测到的认证方式
-    stores.json       — 发现的数据存储 (localStorage/cookie 等)
-```
-
-**设计要点**:
-- 整个 Explore 过程是**一次性的浏览器会话**，从打开页面到写入 JSON 文件一气呵成
-- 所有分析规则都是**硬编码的确定性规则**（正则 + 关键词映射），不依赖 LLM
-- iframe re-fetch 是一个精巧的设计：SPA 应用通常会 monkey-patch `window.fetch`，但 iframe 中的 `contentWindow.fetch` 是原生的，能拿到真实的响应体
-
-#### 4.2.1 Endpoint 分析引擎源码
-
-`src/analysis.ts`（180 行）— 共享 API 分析助手，同时被 `explore.ts` 和 `record.ts` 使用：
+#### Step 1: 导航 + 开启网络捕获
 
 ```typescript
-// URL 模式化 — 将具体 ID 替换为占位符
-export function urlToPattern(url: string): string {
-  const pathNorm = p.pathname
-    .replace(/\/\d+/g, '/{id}')              // 数字 ID → {id}
-    .replace(/\/[0-9a-fA-F]{8,}/g, '/{hex}') // 16 进制 hash → {hex}
-    .replace(/\/BV[a-zA-Z0-9]{10}/g, '/{bvid}'); // B 站 BV 号 → {bvid}
-  // 过滤掉 VOLATILE_PARAMS (时间戳、随机数等)
-}
-
-// 在 JSON 中递归查找最大对象数组 (最深 5 层)
-export function findArrayPath(obj: unknown, depth = 0): ArrayDiscovery | null {
-  if (depth > 5) return null;
-  // 找到长度 >= 2 且元素为对象的数组 → 返回 { path, items }
-  // 多个候选时选最大的
-}
-
-// 字段名 → 语义角色映射
-export function detectFieldRoles(sampleFields: string[]): Record<string, string> {
-  // 使用 FIELD_ROLES 常量表: { title: ['title','name','headline'], image: ['img','avatar','cover'], ... }
-}
-
-// URL 关键词 → CLI 能力名推导
-export function inferCapabilityName(url: string, goal?: string): string {
-  // hot/popular/trending → 'hot'
-  // search/query → 'search'
-  // feed/timeline/dynamic → 'feed'
-  // comment/reply → 'comments'
-  // favorite/collect/bookmark → 'favorite'
-  // 无匹配 → 取 URL 最后一段路径
-}
-
-// 认证方式检测
-export function detectAuthFromHeaders(headers?: Record<string, string>): string[] {
-  // authorization → 'bearer'
-  // x-csrf/x-xsrf → 'csrf'
-  // x-s/x-t/x-s-common → 'signature' (小红书等签名机制)
-}
-export function detectAuthFromContent(url: string, body: unknown): string[] {
-  // sign/w_rid/token → 'signature' (B 站 wbi 签名)
-  // bearer/access_token → 'bearer'
-}
-
-// 噪声 URL 过滤
-export function isNoiseUrl(url: string): boolean {
-  // 过滤: track/log/analytics/beacon/pixel/ping/heartbeat/keep-alive
-}
-
-// 查询参数分类
-export function classifyQueryParams(url: string): {
-  hasSearch: boolean;     // keyword/q/query 等 → true
-  hasPagination: boolean; // page/offset/cursor 等 → true
-  hasLimit: boolean;      // limit/pageSize/count 等 → true
-}
-
-// 策略推导
-export function inferStrategy(authIndicators: string[]): string {
-  // signature → 'intercept'
-  // bearer/csrf → 'header'
-  // 其他 → 'cookie'
-}
+page.startNetworkCapture()  // 开始录制所有网络请求
+page.goto(url)               // 打开目标页面
+page.wait(3s)                // 等待页面加载
 ```
 
-**框架检测脚本** (`src/scripts/framework.ts`, 40 行):
+此时浏览器已经发出了**初始加载的所有 API 请求**，网络捕获器在后台默默记录。
+
+---
+
+#### Step 2: 自动滚动触发懒加载
 
 ```typescript
-// 注入到页面上下文执行，通过 DOM/window 标记检测前端框架
-export function detectFramework() {
-  const app = document.querySelector('#app') as VueAppEl | null;
-  const w = window as FrameworkWindow;
-  return {
-    vue3:  !!(app && app.__vue_app__),
-    vue2:  !!(app && app.__vue__),
-    react: !!w.__REACT_DEVTOOLS_GLOBAL_HOOK__ || !!document.querySelector('[data-reactroot]'),
-    nextjs: !!w.__NEXT_DATA__,
-    nuxt:  !!w.__NUXT__,
-    pinia: !!(app?.__vue_app__?.config?.globalProperties?.$pinia), // Vue 3 状态管理
-    vuex:  !!(app?.__vue_app__?.config?.globalProperties?.$store), // Vue 2/3 状态管理
-  };
-}
+page.autoScroll({ times: 3, delayMs: 1500 })
 ```
 
-#### 4.2.2 自动点击行为与安全约束
+模拟用户滚动页面 3 次，每次间隔 1.5 秒。目的是触发 **infinite scroll / lazy loading**，让页面发出更多的 API 请求。
 
-Explore 阶段对页面元素的点击操作**默认关闭**，仅在显式指定选项时启用。共有三种模式：
+---
+
+#### Step 2.5: 交互式 Fuzzing（可选，`--auto` / `--click`）
+
+这一步**默认关闭**，仅在显式指定选项时启用。目的是：很多 API 只在用户点击 tab/按钮后才会触发，通过自动点击来"钓出"更多隐藏的 API。
 
 **模式一：默认模式（仅滚动）**
 ```bash
 opencli explore <url>
 ```
-- 只执行 `autoScroll`（3 次滚动）
-- **不点击任何元素**
-- 适合大多数 SPA 页面，滚动即可触发 lazy-loading API 请求
+- 只执行 Step 2 的 `autoScroll`，**不点击任何元素**
+- 适合大多数 SPA 页面
 
-**模式二：`--auto` 盲目模糊点击**
+**模式二：`--click` 精确标签点击**
+```bash
+opencli explore <url> --click "评论,字幕,热门"
+```
+- 根据提供的标签文本，精确定位并点击匹配的 Tab/Button：
+```typescript
+// 按标签点击特定元素
+for (label of clickLabels) {
+  // 找到文本包含该 label 的 button/tab/a/span → click()
+}
+```
+- 在盲目 fuzzing 之前执行
+- 适合需要切换特定 Tab 才能触发 API 的场景
+
+**模式三：`--auto` 盲目模糊点击**
 ```bash
 opencli explore <url> --auto
 ```
-- 执行 `INTERACT_FUZZ_JS` 脚本（`src/scripts/interact.ts`）
-- 选择器范围: `button, [role="button"], [role="tab"], .tab, .btn, a[href="javascript:void(0)"], a[href="#"]`
-- **安全约束**:
-  - 最多点击 **15 个元素**（`.slice(0, 15)`）
-  - 每次点击间隔 **300ms**（`await sleep(300)`）
-  - 只点击**可见元素**（`rect.width > 0 && rect.height > 0`）
-  - 只点击不会导航离开页面的元素（`a[href="javascript:void(0)"]` 和 `a[href="#"]`，排除真实链接）
-  - 使用 `dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))` 而非 `el.click()`，给页面框架处理冒泡的机会
-
-**完整 fuzzing 脚本** (`src/scripts/interact.ts`, 23 行):
+执行 `INTERACT_FUZZ_JS` 脚本（`src/scripts/interact.ts`, 23 行）：
 
 ```typescript
 export async function interactFuzz() {
@@ -528,7 +434,7 @@ export async function interactFuzz() {
           bubbles: true, cancelable: true, view: window
         }));
         clicked++;
-        await sleep(300); // 等 300ms 让网络请求触发
+        await sleep(300); // 等 300ms 让 XHR 有时间发出去
       }
     } catch {} // 单个元素失败不影响后续
   }
@@ -536,15 +442,197 @@ export async function interactFuzz() {
 }
 ```
 
-**模式三：`--click` 精确标签点击**
-```bash
-opencli explore <url> --click "热门,推荐,排行"
-```
-- 根据提供的标签文本，精确定位并点击匹配的 Tab/Button
-- 在盲目 fuzzing 之前执行
-- 适合需要切换特定 Tab 才能触发 API 的场景
+**安全约束**:
+- 最多点击 **15 个元素**（`.slice(0, 15)`）
+- 每次点击间隔 **300ms**，给网络请求触发时间
+- 只点击**可见元素**（`rect.width > 0 && rect.height > 0`）
+- 只点击不会导航离开页面的元素（排除真实链接，仅 `a[href="javascript:void(0)"]` 和 `a[href="#"]`）
+- 使用 `dispatchEvent(new MouseEvent('click'))` 而非 `el.click()`，给页面框架处理冒泡的机会
 
-**点击的目的**: 不是为了"浏览页面"，而是为了**触发更多 API 请求**。许多 SPA 页面的数据接口只有在点击特定 Tab 或按钮后才会被调用。通过有限度的点击，Explore 能发现更多隐藏的 API endpoints。
+---
+
+#### Step 3: 读取页面元数据
+
+```typescript
+page.evaluate(() => ({ url: window.location.href, title: document.title }))
+```
+
+---
+
+#### Step 4: 收割网络流量
+
+```typescript
+page.readNetworkCapture()   // 拿到所有捕获的网络请求
+parseNetworkRequests()      // 统一格式化为 { method, url, status, contentType, responseBody }
+```
+
+到这一步，已经有了页面加载期间**所有 HTTP 请求的完整记录** — 包括初始加载、滚动触发和点击触发的全部请求。
+
+---
+
+#### Step 5: 补充抓取 JSON 响应体（iframe Re-Fetch）
+
+对于只拦截到了 URL 但没有 body 的 JSON 请求，在浏览器内用 **iframe** 重新 fetch：
+
+```typescript
+// 创建一个干净的 iframe，用其 fetch（避免 SPA 框架拦截）
+iframe = document.createElement('iframe');
+iframe.contentWindow.fetch(url, { credentials: 'include' });
+// 拿回 JSON body，限制 10KB 防止过大
+```
+
+**为什么用 iframe？** 因为很多 SPA 框架（React/Vue）会 monkey-patch `window.fetch`，直接调 fetch 可能被拦截或返回缓存数据。iframe 的 `contentWindow.fetch` 是**原始的、未被篡改的**。
+
+---
+
+#### Step 6: 检测前端框架和状态管理
+
+注入 `src/scripts/framework.ts`（40 行）到页面上下文执行：
+
+```typescript
+export function detectFramework() {
+  const app = document.querySelector('#app') as VueAppEl | null;
+  const w = window as FrameworkWindow;
+  return {
+    vue3:  !!(app && app.__vue_app__),
+    vue2:  !!(app && app.__vue__),
+    react: !!w.__REACT_DEVTOOLS_GLOBAL_HOOK__ || !!document.querySelector('[data-reactroot]'),
+    nextjs: !!w.__NEXT_DATA__,
+    nuxt:  !!w.__NUXT__,
+    pinia: !!(app?.__vue_app__?.config?.globalProperties?.$pinia),
+    vuex:  !!(app?.__vue_app__?.config?.globalProperties?.$store),
+  };
+}
+```
+
+这些都是各框架留在 DOM / window 上的"指纹"。检测结果会写入 `manifest.json`，供后续 synthesize 阶段参考。
+
+---
+
+#### Step 7: 端点分析 — 确定性规则引擎（核心智能在这里）
+
+`analyzeEndpoints()` + `src/analysis.ts`（180 行）用**纯规则引擎**完成以下分析：
+
+**a) URL 归一化** (`urlToPattern`):
+
+```
+https://api.zhihu.com/topics/19551894/hot?limit=20&offset=0
+  → api.zhihu.com/topics/{id}/hot?limit={}&offset={}
+```
+
+- 数字 ID → `{id}`
+- Hex 串 → `{hex}`
+- B 站 BV 号 → `{bvid}`
+- 去掉易变参数（timestamp、callback 等 `VOLATILE_PARAMS`）
+
+**b) 过滤噪音** (`isNoiseUrl`):
+
+去掉图片/字体/CSS/JS/tracking/analytics 请求：
+```typescript
+const NOISE_URL_PATTERN = /\/(track|log|analytics|beacon|pixel|ping|heartbeat|keep.?alive)\b/i;
+```
+
+**c) JSON 响应体深度分析** (`findArrayPath`):
+
+```typescript
+// 给定 API 响应：
+{ "data": { "items": [{ "title": "...", "author": "..." }, ...] } }
+
+// findArrayPath() 递归搜索（最深 5 层）：
+// → 找到最大的对象数组
+// → 返回 { path: "data.items", items: [...] }
+```
+
+这是从 JSON 响应中提取"列表数据在哪里"的核心算法。要求数组长度 >= 2 且元素为对象，多个候选时选最大的。
+
+**d) 字段语义识别** (`detectFieldRoles`):
+
+通过预定义的 `FIELD_ROLES` 别名表，自动判断字段角色：
+
+| 预定义别名 | 语义角色 |
+|-----------|---------|
+| `title` / `name` / `headline` | title |
+| `url` / `link` / `href` | url |
+| `author` / `user` / `creator` | author |
+| `img` / `avatar` / `cover` / `thumbnail` | image |
+| `score` / `likes` / `votes` | score |
+| `created_at` / `pubDate` / `publish_time` | time |
+
+**e) 认证策略检测** (`detectAuthFromHeaders` + `detectAuthFromContent`):
+
+| 检测依据 | 推断的认证方式 |
+|---------|-------------|
+| 请求头含 `Authorization` | `bearer` |
+| 请求头含 `X-CSRF` / `X-XSRF` | `csrf` |
+| 请求头含 `X-S` / `X-T` / `X-S-Common` | `signature`（小红书/抖音特有的签名算法）|
+| URL 含 `/wbi/` 或 `w_rid=` | `signature`（B 站 wbi 签名）|
+| 响应体含 `sign` / `w_rid` / `token` 字段 | `signature` |
+
+**f) 查询参数分类** (`classifyQueryParams`):
+
+| 参数名 | 分类 |
+|-------|------|
+| `keyword` / `query` / `q` | 搜索参数 |
+| `page` / `offset` / `cursor` | 分页参数 |
+| `limit` / `count` / `size` / `pageSize` | 限制参数 |
+
+---
+
+#### Step 8: 推断 CLI 能力
+
+`inferCapabilitiesFromEndpoints()` 对排名前 8 的端点，自动推断能力和参数：
+
+**能力名推导**:
+
+| URL 关键词 | 推断的能力名 |
+|-----------|------------|
+| `hot` / `popular` / `trending` / `ranking` | `hot` |
+| `search` / `query` | `search` |
+| `feed` / `timeline` / `dynamic` | `feed` |
+| `comment` / `reply` | `comments` |
+| `history` | `history` |
+| `profile` / `userinfo` / `/me` | `me` |
+| `favorite` / `collect` / `bookmark` | `favorite` |
+| 无匹配 | 取 URL 最后一段路径 |
+
+**参数推荐**:
+- 有搜索参数 → 推荐 `args: [{ name: 'keyword', required: true }]`
+- 有分页参数 → 推荐 `args: [{ name: 'page', default: 1 }]`
+- 始终推荐 → `args: [{ name: 'limit', default: 20 }]`
+
+---
+
+#### Step 9: 写入磁盘
+
+最终输出 **5 个 JSON 文件**到 `.opencli/explore/<site>/`：
+
+| 文件 | 内容 |
+|------|------|
+| `manifest.json` | 站点元数据、框架信息、探索时间 |
+| `endpoints.json` | 所有发现的 API 端点（pattern, arrayPath, fields, auth 等）|
+| `capabilities.json` | 推断出的 CLI 能力（name, strategy, columns, args）|
+| `auth.json` | 认证策略摘要 |
+| `stores.json` | Pinia/Vuex Store 信息（如有）|
+
+这些 JSON artifacts 是后续 Phase 2 (Synthesize) 的输入。
+
+---
+
+#### 零 LLM 的技术原理总结
+
+整个 explore 过程没有任何 LLM 调用，依赖的全是确定性规则：
+
+| 步骤 | 技术手段 | 不用 LLM 的原因 |
+|------|---------|----------------|
+| API 发现 | 浏览器网络抓包 | 网络请求是客观事实，不需要"理解" |
+| 触发更多 API | 自动滚动 + 盲点击 | 机械操作，模拟用户行为 |
+| URL 归一化 | 正则替换 | 数字→`{id}`、Hex→`{hex}` 是固定模式 |
+| 数组发现 | 递归搜索 JSON | 找最大对象数组是纯算法 |
+| 字段语义 | 预定义别名表 | `title`/`name`/`headline` 这类映射是有限集合 |
+| 认证检测 | HTTP 头模式匹配 | Authorization / CSRF 等是标准协议 |
+| 能力命名 | URL 路径关键词 | `hot`/`search`/`feed` 等是通用命名惯例 |
+
+**设计哲学**: 把"网站通常长什么样"的领域知识硬编码为规则，用浏览器当被动探针，从而在不需要任何 AI 推理的情况下完成 API 发现。代价是对于非常规的网站结构可能识别不全，但对主流网站（知乎、B 站、微博、Twitter 等）的覆盖率很高。
 
 ---
 
