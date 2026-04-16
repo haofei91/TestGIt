@@ -11,6 +11,15 @@
 
 **OpenCLI** 是一个将任意网站或 Electron 桌面应用变成命令行工具的框架。核心理念是 "Make any website or Electron App your CLI"，由 AI 驱动 API 发现与适配器生成。
 
+### 仓库规模
+
+| 指标 | 数值 |
+|------|------|
+| 总文件数 | 1244 |
+| TypeScript 源文件 | 179 |
+| 内建适配器 (clis/) | 87+ 站点 |
+| 核心源码 (src/) | ~30 模块 |
+
 ### 核心特性
 
 | 特性 | 说明 |
@@ -90,7 +99,16 @@ Full startup path（按需加载）:
 
 ### 3.2 命令注册中心 (`src/registry.ts`)
 
-使用 `globalThis.__opencli_registry__` 确保跨模块实例的单例注册表：
+使用 `globalThis.__opencli_registry__` 确保跨模块实例的单例注册表。与 `hooks.ts` 一样，这是为了解决 npm link / peerDependency 导致的多模块拷贝问题：
+
+```typescript
+// globalThis 单例模式 — 无论多少份模块拷贝，registry 永远只有一个
+declare global {
+  var __opencli_registry__: Map<string, CliCommand> | undefined;
+}
+const _registry: Map<string, CliCommand> =
+  globalThis.__opencli_registry__ ??= new Map();
+```
 
 - **`cli(opts)`**: 注册命令的统一入口
 - **`normalizeCommand()`**: 将 `strategy` 解码为运行时字段 `browser`、`navigateBefore`
@@ -173,6 +191,51 @@ CLI Process ←→ WebSocket Daemon ←→ Chrome Extension ←→ Chrome Browse
 
 **事务机制**: `Transaction` 类实现安装/更新的原子操作，失败时自动回滚（备份旧目录 → 替换 → finalize/rollback）。
 
+### 3.8 能力路由 (`src/capabilityRouting.ts`)
+
+决定一条命令是否需要浏览器会话的核心路由逻辑：
+
+```typescript
+const BROWSER_ONLY_STEPS = new Set([
+  'navigate', 'click', 'type', 'wait', 'press',
+  'snapshot', 'evaluate', 'intercept', 'tap',
+]);
+
+export function shouldUseBrowserSession(cmd: CliCommand): boolean {
+  if (!cmd.browser) return false;          // 非浏览器命令 → 直接跳过
+  if (cmd.func) return true;               // 有 func → 需要浏览器
+  if (!cmd.pipeline || cmd.pipeline.length === 0) return true;
+  if (cmd.navigateBefore) return true;     // 需要预导航 → 需要浏览器
+  return pipelineNeedsBrowserSession(cmd.pipeline); // 检查 pipeline 步骤
+}
+```
+
+`execution.ts` 中的 `executeCommand()` 调用此函数做路由分叉：浏览器命令走 `browserSession()` → 预导航 → 超时执行 → 关窗口；非浏览器命令直接 `runCommand()`。
+
+### 3.9 CLI 命令定义 (`src/cli.ts`)
+
+`cli.ts` 定义了所有内建管理命令（AI 工作流相关），均使用**懒加载**（`await import()`）：
+
+| 命令 | 说明 | 关键选项 |
+|------|------|---------|
+| `opencli explore <url>` | 浏览器探索：发现 API、stores、推荐策略 | `--auto` `--click <labels>` `--wait <s>` `--goal` `--site` |
+| `opencli synthesize <target>` | 从 explore 结果合成候选适配器 YAML | `--top <n>` |
+| `opencli generate <url>` | 一键全流程: explore → synthesize → verify → register | `--goal` `--site` `--no-register` `--format` |
+| `opencli record <url>` | 录制实时浏览器会话的 API 调用 → 生成候选 YAML | `--poll <ms>` `--timeout <ms>` `--out <dir>` |
+| `opencli cascade <url>` | 策略级联：自动找到最简可行策略 | `--site` |
+
+**record 命令**是 explore 的补充方案：explore 是自动化的一次性快照，record 则是**持续录制**模式 — 打开浏览器后人工操作页面，CLI 每隔 `--poll` 毫秒轮询新的网络请求，`--timeout` 毫秒后自动停止，最终从录制的请求中生成候选适配器。
+
+```typescript
+// cli.ts:234 — record 命令定义
+program
+  .command('record')
+  .description('Record API calls from a live browser session → generate YAML candidates')
+  .argument('<url>', 'URL to open and record')
+  .option('--poll <ms>', 'Poll interval in milliseconds', '2000')
+  .option('--timeout <ms>', 'Auto-stop after N milliseconds (default: 60000)', '60000')
+```
+
 ---
 
 ## 四、Harness 理念深度分析
@@ -243,7 +306,62 @@ Agent 执行 opencli <site> <command>
 
 **核心思想**: AI 生成的适配器不是"生成即完成"，而必须经过 **探索→合成→候选→策略探测→验证→修复→注册** 的完整 harness 流程。
 
-**实现**: `src/generate-verified.ts`
+**实现**: `src/generate-verified.ts`（973 行）
+
+#### v1 合约范围
+
+```typescript
+// generate-verified.ts:5-9 — 设计约束
+// v1 contract keeps scope narrow:
+//   - PUBLIC + COOKIE only        — 不处理 HEADER/INTERCEPT/UI
+//   - read-only JSON API surfaces — 只发现 GET 类 JSON API
+//   - single best candidate only  — 不生成多候选
+//   - bounded repair: select/itemPath replacement once — 修复上限 1 次
+```
+
+**合约设计原则**（源码注释）:
+1. machine-readable — 所有输出可机器解析
+2. explicit + explainable — 每个决策都有明确理由
+3. testable + versioned — 可测试可版本化
+4. taxonomy by skill decision needs — 分类按技能决策需求而非内部错误来源
+5. early hint / terminal outcome share consistent decision language — 统一决策语言
+
+#### 共享决策语言（Shared Decision Language）
+
+`generate-verified.ts` 定义了一套**类型安全的决策语言**，贯穿整个 Harness 流程：
+
+```typescript
+// 终止原因（为什么 blocked）— 按技能决策需求分类
+type StopReason =
+  | 'no-viable-api-surface'              // 未发现 JSON API 端点
+  | 'auth-too-complex'                   // 认证超出 PUBLIC/COOKIE 范围
+  | 'no-viable-candidate'               // 候选存在但不达质量门槛
+  | 'execution-environment-unavailable'; // 浏览器/daemon 不可用
+
+// 升级原因（为什么 needs-human-check）— 面向行动命名
+type EscalationReason =
+  | 'empty-result'               // pipeline 执行但返回空
+  | 'sparse-fields'              // 结果字段过少
+  | 'non-array-result'           // 结果不是数组
+  | 'unsupported-required-args'  // 候选需要无法自动填充的参数
+  | 'timeout'                    // 执行超时
+  | 'selector-mismatch'         // DOM/JSON 路径不匹配
+  | 'verify-inconclusive';       // 歧义验证失败
+
+// 建议行动
+type SuggestedAction =
+  | 'stop'                    // 无更多可尝试
+  | 'inspect-with-browser'    // 人工用浏览器调试
+  | 'ask-for-login'           // 需要人工登录
+  | 'ask-for-sample-arg'      // 需要人工提供参数示例值
+  | 'manual-review';          // 通用人工审查
+
+// 可复用性分级
+type Reusability =
+  | 'verified-artifact'       // 完全验证，可直接使用
+  | 'unverified-candidate'    // 候选存在但未验证
+  | 'not-reusable';           // 无可保留内容
+```
 
 #### 纯 CLI 流程，零 Agent 依赖
 
@@ -308,6 +426,55 @@ Phase 6: Persist
 | `blocked` | 无法继续 | `not-reusable` |
 
 **Early Hint 机制**: 在 explore/synthesize/cascade 每个阶段通过 `onEarlyHint` 回调提前通知调用方，实现成本门控（不适合的 URL 尽早退出，减少不必要的浏览器会话开销）。
+
+```typescript
+// generate-verified.ts:83-104 — EarlyHint 接口
+type EarlyHintReason =
+  | 'api-surface-looks-viable'   // explore 发现可行的 API
+  | 'candidate-ready-for-verify' // 候选准备好验证
+  | 'no-viable-api-surface'      // 无可行 API → 建议停止
+  | 'auth-too-complex'           // 认证过于复杂 → 建议停止
+  | 'no-viable-candidate';       // 无可行候选 → 建议停止
+
+interface EarlyHint {
+  stage: 'explore' | 'synthesize' | 'cascade';
+  continue: boolean;        // 是否继续（false = 建议停止）
+  reason: EarlyHintReason;
+  confidence: 'high' | 'medium' | 'low';
+  candidate?: {             // 当前候选信息（如果有）
+    name: string;
+    command: string;
+    path: string | null;
+    reusability: 'unverified-candidate' | 'not-reusable';
+  };
+  message?: string;
+}
+```
+
+Early Hint 的设计原则是**纯门控**（pure gatekeeping）：它不做终端决策，终端决策由 `GenerateOutcome` 统一负责。Hint 与 Outcome 共享同一套决策语言，使 Agent/Skill 看到的是一条连续的决策路径。
+
+**终端输出契约（GenerateOutcome）**:
+
+```typescript
+interface GenerateOutcome {
+  status: 'success' | 'blocked' | 'needs-human-check';
+  adapter?: VerifiedAdapter;        // success 路径: 已验证的适配器
+  reason?: StopReason;              // blocked 路径: 停止原因
+  escalation?: EscalationContext;   // needs-human-check 路径: 升级上下文
+  reusability?: Reusability;        // 可复用性（success 和 needs-human-check 都有）
+  stats: GenerateStats;             // 统计信息
+  message?: string;                 // 人类可读摘要
+}
+
+interface GenerateStats {
+  endpoint_count: number;       // 发现的总端点数
+  api_endpoint_count: number;   // 其中 JSON API 端点数
+  candidate_count: number;      // 生成的候选数
+  verified: boolean;            // 是否通过验证
+  repair_attempted: boolean;    // 是否尝试过修复
+  explore_dir: string;          // explore 产物目录
+}
+```
 
 #### 4.3.1 Explore 机制详解（9 步确定性流程）
 
@@ -385,6 +552,83 @@ Step 9: Write Artifacts (5 个 JSON 文件)
 - 所有分析规则都是**硬编码的确定性规则**（正则 + 关键词映射），不依赖 LLM
 - iframe re-fetch 是一个精巧的设计：SPA 应用通常会 monkey-patch `window.fetch`，但 iframe 中的 `contentWindow.fetch` 是原生的，能拿到真实的响应体
 
+**Endpoint 分析引擎源码** (`src/analysis.ts`, 180 行):
+
+```typescript
+// URL 模式化 — 将具体 ID 替换为占位符
+export function urlToPattern(url: string): string {
+  const pathNorm = p.pathname
+    .replace(/\/\d+/g, '/{id}')              // 数字 ID → {id}
+    .replace(/\/[0-9a-fA-F]{8,}/g, '/{hex}') // 16 进制 hash → {hex}
+    .replace(/\/BV[a-zA-Z0-9]{10}/g, '/{bvid}'); // B 站 BV 号 → {bvid}
+  // 过滤掉 VOLATILE_PARAMS (时间戳、随机数等)
+}
+
+// 在 JSON 中递归查找最大对象数组 (最深 5 层)
+export function findArrayPath(obj: unknown, depth = 0): ArrayDiscovery | null {
+  if (depth > 5) return null;
+  // 找到长度 >= 2 且元素为对象的数组 → 返回 { path, items }
+  // 多个候选时选最大的
+}
+
+// 字段名 → 语义角色映射
+export function detectFieldRoles(sampleFields: string[]): Record<string, string> {
+  // 使用 FIELD_ROLES 常量表: { title: ['title','name','headline'], image: ['img','avatar','cover'], ... }
+}
+
+// URL 关键词 → CLI 能力名推导
+export function inferCapabilityName(url: string, goal?: string): string {
+  // hot/popular/trending → 'hot'
+  // search/query → 'search'
+  // feed/timeline/dynamic → 'feed'
+  // comment/reply → 'comments'
+  // favorite/collect/bookmark → 'favorite'
+  // 无匹配 → 取 URL 最后一段路径
+}
+
+// 认证方式检测
+export function detectAuthFromHeaders(headers?: Record<string, string>): string[] {
+  // authorization → 'bearer'
+  // x-csrf/x-xsrf → 'csrf'
+  // x-s/x-t/x-s-common → 'signature' (小红书等签名机制)
+}
+export function detectAuthFromContent(url: string, body: unknown): string[] {
+  // sign/w_rid/token → 'signature' (B 站 wbi 签名)
+  // bearer/access_token → 'bearer'
+}
+
+// 噪声 URL 过滤
+export function isNoiseUrl(url: string): boolean {
+  // 过滤: track/log/analytics/beacon/pixel/ping/heartbeat/keep-alive
+}
+
+// 查询参数分类
+export function classifyQueryParams(url: string): {
+  hasSearch: boolean;     // keyword/q/query 等 → true
+  hasPagination: boolean; // page/offset/cursor 等 → true
+  hasLimit: boolean;      // limit/pageSize/count 等 → true
+}
+```
+
+**框架检测脚本** (`src/scripts/framework.ts`, 40 行):
+
+```typescript
+// 注入到页面上下文执行，通过 DOM/window 标记检测前端框架
+export function detectFramework() {
+  const app = document.querySelector('#app') as VueAppEl | null;
+  const w = window as FrameworkWindow;
+  return {
+    vue3:  !!(app && app.__vue_app__),
+    vue2:  !!(app && app.__vue__),
+    react: !!w.__REACT_DEVTOOLS_GLOBAL_HOOK__ || !!document.querySelector('[data-reactroot]'),
+    nextjs: !!w.__NEXT_DATA__,
+    nuxt:  !!w.__NUXT__,
+    pinia: !!(app?.__vue_app__?.config?.globalProperties?.$pinia), // Vue 3 状态管理
+    vuex:  !!(app?.__vue_app__?.config?.globalProperties?.$store), // Vue 2/3 状态管理
+  };
+}
+```
+
 #### 4.3.2 自动点击行为与安全约束
 
 Explore 阶段对页面元素的点击操作**默认关闭**，仅在显式指定选项时启用。共有三种模式：
@@ -410,6 +654,33 @@ opencli explore <url> --auto
   - 只点击不会导航离开页面的元素（`a[href="javascript:void(0)"]` 和 `a[href="#"]`，排除真实链接）
   - 使用 `dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))` 而非 `el.click()`，给页面框架处理冒泡的机会
 
+**完整 fuzzing 脚本** (`src/scripts/interact.ts`, 23 行):
+
+```typescript
+export async function interactFuzz() {
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const clickables = Array.from(document.querySelectorAll(
+    'button, [role="button"], [role="tab"], .tab, .btn, ' +
+    'a[href="javascript:void(0)"], a[href="#"]'
+  )).slice(0, 15); // 限制最多 15 个，防止死循环
+
+  let clicked = 0;
+  for (const el of clickables) {
+    try {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) { // 只点可见元素
+        el.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true, view: window
+        }));
+        clicked++;
+        await sleep(300); // 等 300ms 让网络请求触发
+      }
+    } catch {} // 单个元素失败不影响后续
+  }
+  return clicked;
+}
+```
+
 **模式三：`--click` 精确标签点击**
 ```bash
 opencli explore <url> --click "热门,推荐,排行"
@@ -424,20 +695,58 @@ opencli explore <url> --click "热门,推荐,排行"
 
 **核心思想**: 自动发现最小权限策略，不需要人工指定。
 
-**实现**: `src/cascade.ts`
+**实现**: `src/cascade.ts`（184 行）
+
+**完整 5 级策略链**:
+
+```typescript
+// cascade.ts:26 — 策略级联顺序
+const CASCADE_ORDER: Strategy[] = [
+  Strategy.PUBLIC,    // 直接 fetch, 无 credentials
+  Strategy.COOKIE,    // fetch with credentials: 'include'
+  Strategy.HEADER,    // fetch + 提取 CSRF token (ct0/csrf_token/_csrf)
+  Strategy.INTERCEPT, // 需要签名/加密，站点特定实现
+  Strategy.UI,        // 需要浏览器 DOM 交互获取数据
+];
+```
+
+**探测流程**:
 
 ```
-PUBLIC (直接 fetch, 无 credentials)
-  → 成功 → 返回 PUBLIC
+PUBLIC → page.evaluate(fetch(url, {}))
+  → 成功且 hasData → 返回 PUBLIC (confidence: 1.0)
   → 失败 ↓
-COOKIE (fetch with credentials: 'include')
-  → 成功 → 返回 COOKIE
+COOKIE → page.evaluate(fetch(url, { credentials: 'include' }))
+  → 成功且 hasData → 返回 COOKIE (confidence: 0.9)
   → 失败 ↓
-HEADER (fetch + 提取 CSRF token)
-  → 成功 → 返回 HEADER
+HEADER → page.evaluate(fetch(url, { credentials: 'include', headers: { 'X-Csrf-Token': csrf } }))
+  → 成功且 hasData → 返回 HEADER (confidence: 0.8)
   → 失败 ↓
-默认回退 → COOKIE (confidence: 0.3)
+INTERCEPT / UI → 跳过（需要站点特定实现，不自动探测）
+  → 默认回退 → COOKIE (confidence: 0.3)
 ```
+
+**关键实现细节**:
+
+```typescript
+// cascade.ts:93 — 策略 → fetch 选项映射
+const PROBE_OPTIONS = {
+  [Strategy.PUBLIC]:  {},
+  [Strategy.COOKIE]:  { credentials: true },
+  [Strategy.HEADER]:  { credentials: true, extractCsrf: true },
+  // INTERCEPT / UI 无映射 → 输出 "requires site-specific implementation"
+};
+
+// cascade.ts:156 — 置信度公式
+confidence: 1.0 - (i * 0.1)  // 越简单的策略 → 越高的置信度
+
+// cascade.ts:142 — 自动探测上限
+const maxIdx = CASCADE_ORDER.indexOf(Strategy.HEADER); // 默认最多探测到 HEADER
+```
+
+**CSRF Token 提取逻辑**: 从 `document.cookie` 中查找 `ct0=`（Twitter）、`csrf_token=`、`_csrf=` 前缀的 cookie，提取值后设置到 `X-Csrf-Token` 和 `X-XSRF-Token` 请求头。
+
+**数据有效性判定**: `hasData` 不仅检查响应是否非空，还会检查中国站点常见的 API 错误码模式 — 如果 `json.code !== undefined && json.code !== 0`，则判定为无有效数据。
 
 置信度评分: 越简单的策略成功时置信度越高 (1.0 - index * 0.1)。
 
@@ -503,7 +812,33 @@ Smoke Tests (tests/smoke/*.test.ts)
 
 ### 4.7 理念七：Lifecycle Hook Harness（生命周期钩子线束）
 
-**实现**: `src/hooks.ts`
+**实现**: `src/hooks.ts`（92 行）
+
+**globalThis 单例模式**:
+
+与 `registry.ts` 相同，hooks 使用 `globalThis.__opencli_hooks__` 保证跨模块单例。这是因为 TS 插件通过 npm link / peerDependency 符号链接加载时，可能存在多份模块拷贝，`globalThis` 确保所有拷贝共享同一个 hook store：
+
+```typescript
+// hooks.ts:36-41 — globalThis 单例保证
+declare global {
+  var __opencli_hooks__: Map<HookName, HookFn[]> | undefined;
+}
+const _hooks: Map<HookName, HookFn[]> =
+  globalThis.__opencli_hooks__ ??= new Map();
+```
+
+**HookContext 接口**:
+
+```typescript
+interface HookContext {
+  command: string;                  // "site/name" 格式，或 "__startup__"
+  args: Record<string, unknown>;    // 已校验的参数
+  startedAt?: number;               // 执行开始时间 (epoch ms)
+  finishedAt?: number;              // 执行结束时间 (epoch ms)
+  error?: unknown;                  // 命令抛出的错误
+  [key: string]: unknown;           // 插件可附加任意数据用于跨钩子通信
+}
+```
 
 三个生命周期钩子点：
 
@@ -513,7 +848,23 @@ onBeforeExecute  → 每次命令执行前
 onAfterExecute   → 每次命令执行后（携带结果/错误）
 ```
 
-**隔离保证**: 每个 handler 用 try/catch 包裹，一个钩子失败不会阻塞命令执行。
+**隔离保证**: 每个 handler 用 try/catch 包裹，一个钩子失败不会阻塞命令执行：
+
+```typescript
+// hooks.ts:73-84 — 钩子发射（隔离执行）
+export async function emitHook(name: HookName, ctx: HookContext, result?: unknown): Promise<void> {
+  for (const fn of handlers) {
+    try {
+      await fn(ctx, result);
+    } catch (err) {
+      log.warn(`Hook ${name} handler failed: ${err.message}`);
+      // 不抛出，不阻塞
+    }
+  }
+}
+```
+
+**测试支持**: `clearAllHooks()` 方法用于测试时重置全局 hook store。
 
 ### 4.8 理念八：Validation Harness（校验线束）
 
@@ -543,9 +894,12 @@ onAfterExecute   → 每次命令执行后（携带结果/错误）
 | **安全边界前置** | Diagnostic 输出前脱敏；Self-Repair 限定修改 scope；AutoResearch 限定变更 scope |
 | **渐进式降级** | 预算耗尽时按优先级砍信息；Cascade 探测失败后降级 |
 | **机械可度量** | AutoResearch 要求度量值必须是数字，非数字无法进入循环 |
-| **确定性优先** | 同命令同输出 schema；运行时零 LLM 消费 |
+| **确定性优先** | 同命令同输出 schema；运行时零 LLM 消费；Explore 全程确定性规则 |
 | **事务原子性** | 插件安装/更新使用 Transaction + rollback 机制 |
 | **钩子隔离** | Hook handler 失败不阻塞主流程 |
+| **globalThis 单例** | Registry、Hooks 通过 globalThis 解决 npm link 多拷贝问题 |
+| **统一决策语言** | Verified Generation 中 EarlyHint 和 GenerateOutcome 共享类型体系 |
+| **懒加载** | 命令模块按需 import()，CLI 管理命令按需 import()，极致冷启动 |
 
 ### 5.2 Harness 理念的统一框架
 
@@ -575,6 +929,11 @@ onAfterExecute   → 每次命令执行后（携带结果/错误）
 5. **"命令即 Spec"**: 自修复不需要预先定义 spec 文件，极大降低维护成本
 6. **事务化文件操作**: 插件安装/更新的 `beginReplaceDir` + `Transaction` 模式值得在任何需要原子文件替换的场景借鉴
 7. **AutoResearch 循环**: 将 AI 改进代码的过程工程化为 constraint+metric+loop，可复制到其他 AI 自动化场景
+8. **iframe re-fetch 绕过 SPA monkey-patching**: Explore 中用 `iframe.contentWindow.fetch` 获取原生 fetch，是对付 SPA 框架劫持网络层的精巧方案
+9. **统一决策语言**: `generate-verified.ts` 中 EarlyHint 和 GenerateOutcome 共享同一套类型体系（StopReason / EscalationReason / Reusability），Agent 看到的是一条连续决策路径而非割裂的状态码
+10. **globalThis 单例模式**: 用于解决 npm link / peerDependency 符号链接导致的模块多拷贝问题，registry 和 hooks 都采用此模式，值得在任何需要跨模块共享状态的 Node.js 项目中借鉴
+11. **record 命令补充 explore**: explore 是自动化一次性快照，record 是人工操作+持续录制，两者互补覆盖不同场景
+12. **能力路由分离**: `capabilityRouting.ts` 将"是否需要浏览器会话"的判定逻辑独立为纯函数，使 `execution.ts` 保持简洁
 
 ---
 
