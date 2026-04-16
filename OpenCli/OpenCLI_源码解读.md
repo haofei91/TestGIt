@@ -1886,6 +1886,47 @@ Skill = 驾校教材
 
 ### 7.4 重点：opencli-explorer Skill
 
+#### 首先澄清：Skill ≠ CLI 命令，名字相似但完全不同
+
+`opencli-explorer`（Skill）和 `opencli explore`（CLI 命令）名字很像，容易混淆，但它们是不同层面的东西：
+
+| | `opencli explore` (CLI 命令) | `opencli-explorer` (Skill) |
+|---|---|---|
+| **本质** | 一段确定性代码 | 一份 Markdown 教程（~38KB） |
+| **执行者** | CLI 自己跑（无需 Agent） | Agent 读完后手动操作 |
+| **核心手段** | 自动探测 API（iframe fetch + 遍历） | `opencli browser open/network/click/eval` — **浏览器手动探索** |
+| **能力上限** | PUBLIC + COOKIE，单次快照 | 任意 Tier，可反复交互和判断 |
+
+SKILL.md 第 56 行甚至把 `opencli explore` 列为**错误做法**：
+
+```
+❌ 错误做法：只用 opencli explore，等结果出来
+✅ 正确做法：用 opencli browser open 主动浏览
+```
+
+**Skill 的核心是 `opencli browser` 系列命令**（手动操控浏览器），而不是 `opencli explore`（自动化探测）。`opencli explore` 只在 SKILL.md 末尾的"快捷参考"中作为可选辅助手段出现。
+
+#### 两条路径的关系：不只是"失败才切 Skill"
+
+```
+用户想做一个新站点适配器
+  │
+  ├─ 路径 A: 先试 opencli generate（内部调 explore + cascade + verify）
+  │    ├─ 成功 → 完事，不需要 Skill
+  │    └─ 失败 (blocked/auth-too-complex) → 转路径 B
+  │
+  ├─ 路径 B: 直接用 opencli-explorer Skill 手动做
+  │    └─ Agent 读 SKILL.md → 用 browser 命令探索
+  │       → 选 Tier 策略 → 手写 func() 适配器
+  │
+  └─ 有些场景直接走路径 B，不试路径 A:
+       • 已知是高 Tier 站点（小红书、Twitter）→ 试 generate 必定 blocked，没必要浪费时间
+       • 同站点需要多个命令 → generate 只能出一个最佳候选
+       • 产物要提 PR → 需要按 clis/<site>/ 目录结构组织，generate 不做这个
+```
+
+**所以准确说法是**：Skill 和 CLI `generate` 是"手动挡 vs 自动挡"的关系。简单路况先开自动挡（generate），复杂路况直接手动挡（Skill），而不是"自动挡坏了才切手动挡"。
+
 **文件结构**:
 
 ```
@@ -1899,18 +1940,18 @@ skills/opencli-explorer/
 
 总计 ~38KB 的 Agent 操作知识。
 
-#### 路径选择器 — 先试 CLI，失败再走 Skill
+#### SKILL.md 中的路径选择器
 
-SKILL.md 开头就引导 Agent 判断该走哪条路：
+SKILL.md 开头引导 Agent 判断该走哪条路（注意：不是"只有失败才走 Skill"）：
 
 | 情况 | 走这里 |
 |------|--------|
 | 只要为一个具体页面生成一个命令 | `opencli-oneshot` skill |
 | 想先让机器自动试一遍 | **`opencli generate`，失败再回来** |
-| 新站点 / 多个命令 / oneshot 卡住了 | 继续读 explorer |
-| 产物要提 PR | explorer + `clis/<site>/` + `npm run build` |
+| 新站点 / 多个命令 / oneshot 卡住了 | **直接走 explorer**（不必先试 generate） |
+| 产物要提 PR | **直接走 explorer** + `clis/<site>/` + `npm run build` |
 
-**Skill 明确把 CLI 作为第一选择**。
+Skill 把 CLI `generate` 作为简单场景的快捷入口，但对于第三、四行的情况，**直接走 Skill 才是正确路径**。
 
 #### 5 步流程
 
