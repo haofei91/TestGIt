@@ -1554,6 +1554,19 @@ e2e-headed.yml 分配的 VM（并行）:
 时间线: 开发者 git push → GitHub 感知 → 匹配 yml 规则 → 分配 VM → 执行测试 → 结果回写 PR
 ```
 
+**职责分界**: Testing Harness 的运行依赖 GitHub Actions（GitHub 平台自带的 CI/CD 服务），OpenCLI 和 GitHub 各负责一半：
+
+| OpenCLI 开发者负责（写在仓库里） | GitHub 平台负责（基础设施） |
+|------|------|
+| 写测试代码 (`tests/e2e/*.test.ts` 等) | 监听 git 事件 (push/PR/schedule) |
+| 写 CI 配置 (`.github/workflows/*.yml`) | 读取 yml 并匹配触发规则 |
+| 定义触发规则 (`on:` + `paths:` 过滤) | 分配云端 VM (ubuntu/macOS/Windows) |
+| 定义执行步骤 (`steps:` npm ci → build → test) | 在 VM 上按 steps 执行、收集日志 |
+| | 结果写回 PR 页面 Checks 面板 |
+| | 执行完毕后销毁 VM |
+
+PR 创建后测试是全自动触发的，开发者不需要点任何"运行测试"按钮。GitHub Actions 不是唯一选择 — GitLab CI (`.gitlab-ci.yml`)、Jenkins (`Jenkinsfile`)、CircleCI 等同类工具原理相同：仓库放配置文件 → 平台感知事件 → 按配置分配机器跑脚本。
+
 #### Testing Harness 与其他 Harness 的配合
 
 ```
