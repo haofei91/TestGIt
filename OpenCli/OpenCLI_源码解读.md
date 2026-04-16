@@ -2019,6 +2019,330 @@ cli({
 
 这些知识无法编码为确定性规则（因为每个网站的风控和签名方式不同），只能以"经验文档"形式传授给 Agent。
 
+#### CLI 搞不定的具体场景与 Skill 指导方式
+
+以下每个例子都遵循同一模式：**CLI 卡在哪 → Skill 教 Agent 什么 → Agent 最终写出什么代码**。
+
+---
+
+**场景 1：Tier 2.5 — localStorage Bearer（以 Slock 多租户 SaaS 为例）**
+
+**CLI 卡在哪**：`opencli generate https://app.slock.it --goal "list devices"` 返回 `blocked: auth-too-complex`。原因是 Slock 把 JWT 存在 `localStorage`，不放 Cookie，CLI 的 CASCADE 策略只会尝试 PUBLIC 和 COOKIE，不会去读 `localStorage`。
+
+**Skill 教 Agent 什么**（adapter-templates.md Tier 2.5 模板）：
+
+```
+Skill 指导要点:
+1. 用 opencli browser open 打开已登录页面
+2. 用 opencli browser eval "localStorage.getItem('access_token')" 提取 Bearer
+3. 用 opencli browser eval "localStorage.getItem('serverId')" 提取租户上下文
+4. 在 func() 中用 page.evaluate() 组装请求头: Authorization + X-Server-Id
+5. 如果 Bearer 过期，throw new AuthRequiredError('token expired')
+```
+
+**Agent 最终写出的代码**：
+
+```typescript
+// clis/slock/list-devices.ts — CLI generate 无法生成
+cli({
+  site: 'slock',
+  name: 'list-devices',
+  strategy: Strategy.COOKIE,  // 需要浏览器会话
+  browser: true,
+  func: async (page, kwargs) => {
+    // Step 1: 从 localStorage 拿 Bearer（Skill 教的关键步骤）
+    const token = await page.evaluate(
+      `localStorage.getItem('access_token')`
+    );
+    if (!token) throw new AuthRequiredError('no token in localStorage');
+
+    // Step 2: 从 localStorage 拿多租户上下文 ID（Skill 教的关键步骤）
+    const serverId = await page.evaluate(
+      `localStorage.getItem('serverId')`
+    );
+
+    // Step 3: 组装请求 — 两个自定义 Header，CLI 无法自动发现
+    const data = await page.evaluate(`(async () => {
+      const res = await fetch('/api/v1/devices', {
+        headers: {
+          'Authorization': 'Bearer ${token}',
+          'X-Server-Id': '${serverId}'
+        }
+      });
+      if (!res.ok) throw new Error('API ' + res.status);
+      return (await res.json()).devices;
+    })()`);
+    return data.slice(0, kwargs.limit);
+  },
+});
+```
+
+**CLI 搞不定的根本原因**：CASCADE 只试 `credentials:'include'`（Cookie）和无认证（PUBLIC），不会执行 `localStorage.getItem()` 去发现 Bearer Token，也不知道还需要一个 `X-Server-Id` 业务上下文头。
+
+---
+
+**场景 2：Tier 3 — CSRF Token + Bearer（以 Twitter 为例）**
+
+**CLI 卡在哪**：`opencli generate https://twitter.com --goal "user timeline"` 返回 `blocked: auth-too-complex`。Twitter API 需要同时带 `Authorization: Bearer AAAAAAAAAAAAAAAAAAAAANRILg...`（固定 Bearer）+ `x-csrf-token`（从 `ct0` Cookie 动态提取）+ `X-Twitter-Auth-Type: OAuth2Session`。
+
+**Skill 教 Agent 什么**（adapter-templates.md Tier 3 模板）：
+
+```
+Skill 指导要点:
+1. Bearer token 是固定值，硬编码到适配器中（公开在 Twitter 前端 JS 里）
+2. CSRF token 要从 document.cookie 中提取 ct0 字段
+3. 必须带 X-Twitter-Auth-Type: OAuth2Session，否则返回 403
+4. 响应体结构: { data: { user: { result: { timeline_v2: ... } } } }
+5. 将 extractToken 逻辑放到 utils.js 中复用（同站点多个命令共享）
+```
+
+**Agent 最终写出的代码**：
+
+```typescript
+// clis/twitter/utils.js — Skill 教的 utils.js 抽取模式
+export function extractCsrf() {
+  return document.cookie.match(/ct0=([^;]+)/)?.[1] ?? '';
+}
+export const BEARER =
+  'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xn...(截断)';
+
+// clis/twitter/user-timeline.ts — CLI generate 无法生成
+cli({
+  site: 'twitter',
+  name: 'user-timeline',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  args: [{ name: 'username', required: true }],
+  func: async (page, kwargs) => {
+    await page.goto(`https://twitter.com/${kwargs.username}`);
+    const data = await page.evaluate(`(async () => {
+      // Skill 教的三步认证组装
+      const csrf = document.cookie.match(/ct0=([^;]+)/)?.[1] ?? '';
+      const res = await fetch(
+        'https://twitter.com/i/api/graphql/xyz/UserTweets?variables=...',
+        {
+          headers: {
+            'Authorization': 'Bearer AAAAAAAAAAAAAAAAAAA...',
+            'x-csrf-token': csrf,
+            'X-Twitter-Auth-Type': 'OAuth2Session'
+          },
+          credentials: 'include'
+        }
+      );
+      return (await res.json()).data.user.result.timeline_v2
+        .timeline.instructions[0].entries;
+    })()`);
+    return data.slice(0, kwargs.limit);
+  },
+});
+```
+
+**CLI 搞不定的根本原因**：CASCADE 尝试 COOKIE 策略时只加 `credentials:'include'`，但 Twitter 还要求三个额外 Header（固定 Bearer + 动态 CSRF + Auth-Type），缺任何一个都返回 403。CLI 没有"从 Cookie 中提取特定字段构造 Header"的能力。
+
+---
+
+**场景 3：Tier 4 — Pinia Store 拦截（以小红书通知为例）**
+
+**CLI 卡在哪**：`opencli generate https://www.xiaohongshu.com --goal "notifications"` 返回 `blocked: auth-too-complex`。小红书所有 API 都需要 `X-s`/`X-t` 签名，这些签名由前端 JS 运行时计算，无法从外部构造。
+
+**Skill 教 Agent 什么**（adapter-templates.md Tier 4 Pinia 模板）：
+
+```
+Skill 指导要点:
+1. 不要自己构造请求！利用前端框架（Vue/Pinia）的 Store Action 发请求
+2. 用 page.evaluate('$pinia') 检测是否有 Pinia Store
+3. 找到目标 Store 后调用其 Action: store.getNotification()
+4. Store Action 内部会自动计算签名 — 我们不需要知道签名算法
+5. 如果 Store 没有现成 Action，退而用 installInterceptor + getInterceptedRequests
+```
+
+**Agent 最终写出的代码**：
+
+```typescript
+// clis/xiaohongshu/notifications.ts — CLI generate 完全无法生成
+cli({
+  site: 'xiaohongshu',
+  name: 'notifications',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  func: async (page, kwargs) => {
+    await page.goto('https://www.xiaohongshu.com');
+
+    // 方案 A: 直接调 Pinia Store Action（Skill 教的核心技巧）
+    const data = await page.evaluate(`(async () => {
+      const store = window.$pinia._s.get('notification');
+      if (!store) throw new Error('notification store not found');
+      await store.getNotification();    // ← 内部自动签名 X-s/X-t
+      return store.notifications;       // ← 已经是结构化数据
+    })()`);
+    return data.slice(0, kwargs.limit);
+  },
+});
+```
+
+**场景 3b：Tier 4 — XHR 拦截 + 自动滚动（以小红书用户帖子为例）**
+
+当 Pinia Store 没有现成的 Action 时，Skill 教 Agent 用拦截器方案：
+
+```typescript
+// clis/xiaohongshu/user-posts.ts — 拦截器模式
+cli({
+  site: 'xiaohongshu',
+  name: 'user-posts',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  args: [{ name: 'userId', required: true }],
+  func: async (page, kwargs) => {
+    // Step 1: 安装请求拦截器（Skill 教的模式）
+    await page.evaluate(`installInterceptor('v1/user/post')`);
+
+    // Step 2: 导航到目标页面，触发 API 请求
+    await page.goto(
+      `https://www.xiaohongshu.com/user/profile/${kwargs.userId}`
+    );
+
+    // Step 3: 自动滚动触发懒加载（Skill 教的模式）
+    await page.evaluate(`autoScroll()`);
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Step 4: 收割拦截到的响应
+    const data = await page.evaluate(`getInterceptedRequests()`);
+    const posts = data.flatMap(r => r.response?.data?.notes ?? []);
+    return posts.slice(0, kwargs.limit);
+  },
+});
+```
+
+**CLI 搞不定的根本原因**：CLI generate 只能生成 pipeline（声明式 fetch），但小红书的签名算法在前端 JS 运行时里，pipeline 无法调用浏览器内的 JS 函数。Skill 教 Agent 两条绕过路径：(1) 调 Pinia Store Action 让框架自己签名，(2) 安装 XHR 拦截器被动捕获已签名的请求。
+
+---
+
+**场景 4：分页参数（CLI 不支持，Skill 教模式）**
+
+**CLI 卡在哪**：`opencli generate` 生成的适配器只获取第一页数据，不支持 `--page`/`--limit` 参数。
+
+**Skill 教 Agent 什么**：
+
+```
+Skill 指导要点:
+1. 在 args 中声明 page 和 limit 参数，设置默认值
+2. 在 API URL 中用模板字符串注入分页参数
+3. limit 加上限保护: Math.min(kwargs.limit, 50) — 防止触发反爬
+4. page 从 1 开始还是从 0 开始，看目标 API 的约定
+```
+
+```typescript
+// Skill 教的分页模板 — CLI generate 不会生成 args
+cli({
+  site: 'v2ex',
+  name: 'topics',
+  args: [
+    { name: 'page', type: 'number', default: 1 },
+    { name: 'limit', type: 'number', default: 20 },
+  ],
+  pipeline: [
+    { fetch: 'https://www.v2ex.com/api/v2/topics?p={page}&ps={limit}' },
+    { select: '$.result' },
+    { pick: ['id', 'title', 'content', 'created'] },
+  ],
+});
+```
+
+---
+
+**场景 5：utils.js 共享认证逻辑（CLI 不支持，Skill 教模式）**
+
+**CLI 卡在哪**：`opencli generate` 每次只生成单个命令，同一站点第二个命令会重复写认证逻辑。
+
+**Skill 教 Agent 什么**：
+
+```
+Skill 指导要点:
+1. 同站点第 2+ 个命令，先检查 clis/<site>/ 目录有没有已有适配器
+2. 把重复的认证逻辑（Bearer 提取、CSRF 构造）抽到 clis/<site>/utils.js
+3. 每个命令 import { getAuth } from './utils.js'
+4. 这样修改认证逻辑只需改一处
+```
+
+```typescript
+// clis/twitter/utils.js — Agent 按 Skill 指导抽取的共享模块
+export function getAuthHeaders(page) {
+  return page.evaluate(`(async () => {
+    const csrf = document.cookie.match(/ct0=([^;]+)/)?.[1] ?? '';
+    return {
+      'Authorization': 'Bearer AAAAAAAAAAAAA...',
+      'x-csrf-token': csrf,
+      'X-Twitter-Auth-Type': 'OAuth2Session'
+    };
+  })()`);
+}
+
+// clis/twitter/user-timeline.ts — import 共享认证
+import { getAuthHeaders } from './utils.js';
+// ...在 func 中: const headers = await getAuthHeaders(page);
+
+// clis/twitter/search.ts — 同样 import，不重复写
+import { getAuthHeaders } from './utils.js';
+```
+
+---
+
+**场景 6：CliError 错误处理规范（CLI generate 不做，Skill 教规范）**
+
+**CLI 卡在哪**：`opencli generate` 生成的适配器没有错误处理逻辑 — API 返回空数据或认证过期时直接返回空数组，上层无法区分"确实没数据"和"认证失败"。
+
+**Skill 教 Agent 什么**：
+
+```
+Skill 指导要点:
+1. 认证失败 → throw new AuthRequiredError('reason') — exitCode 77
+2. 空结果    → throw new EmptyResultError('reason') — exitCode 66
+3. 参数错误  → throw new ArgumentError('reason')    — exitCode 2
+4. 超时     → throw new TimeoutError('reason')      — exitCode 75
+5. 绝对不要 return { error: '...' } — 这会污染 JSON 输出格式
+```
+
+```typescript
+// ❌ CLI generate 可能生成的（无错误处理）
+func: async (page, kwargs) => {
+  const res = await fetch('/api/data');
+  const json = await res.json();
+  return json.items ?? [];  // 认证过期也返回 []，上层无法区分
+};
+
+// ✅ Skill 教 Agent 写的（结构化错误）
+func: async (page, kwargs) => {
+  const res = await fetch('/api/data', { credentials: 'include' });
+  if (res.status === 401 || res.status === 403) {
+    throw new AuthRequiredError('session expired, re-login needed');
+  }
+  const json = await res.json();
+  // 风控伪 200 检测（Skill 教的关键知识）
+  if (json.code !== 0 || !json.data) {
+    throw new AuthRequiredError('anti-crawl triggered: ' + json.msg);
+  }
+  if (!json.data.items?.length) {
+    throw new EmptyResultError('no items for query: ' + kwargs.keyword);
+  }
+  return json.data.items.slice(0, kwargs.limit);
+};
+```
+
+---
+
+**六个场景总结**：
+
+| 场景 | Tier | CLI 卡点 | Skill 教的核心技巧 |
+|------|------|---------|-------------------|
+| Slock 多租户 SaaS | 2.5 | 不会读 localStorage | `localStorage.getItem()` + 自定义 Header |
+| Twitter CSRF | 3 | 不会从 Cookie 提取字段构造 Header | `document.cookie.match()` + 三头组装 |
+| 小红书通知 (Pinia) | 4 | 不会调前端框架 Store Action | `$pinia._s.get()` + `store.action()` |
+| 小红书帖子 (拦截) | 4 | pipeline 无法拦截 XHR | `installInterceptor()` + `autoScroll()` |
+| 分页参数 | - | 只生成单页无参数 | `args` 声明 + URL 模板注入 |
+| 错误处理 | - | 无错误处理逻辑 | `CliError` 子类 + 风控伪 200 检测 |
+
+**核心结论**：CLI `generate` 是确定性规则引擎，覆盖 PUBLIC + COOKIE + 标准 JSON API；一旦涉及 **自定义 Header 构造、前端框架交互、请求拦截、分页参数、共享逻辑抽取、结构化错误处理** — 这些都超出确定性规则的表达能力，必须由 Agent 读取 Skill 文档后手动实现。Skill 不是"备选方案"，而是 CLI 设计之初就规划好的 **能力边界分工**：确定性的交给代码，需要判断力的交给 Agent + Skill。
+
 ---
 
 ## 八、Harness 理念的统一框架
