@@ -1355,31 +1355,180 @@ git history                          ← 保留的改进 commit（discard 的已
 
 ### 6.2 Testing Harness（测试线束）
 
-四层测试架构：
+**核心思想**: 四层测试在不同时机自动/手动触发，每层覆盖不同的验证目标，从编译检查到真实网站 E2E，形成完整的质量守护网。
+
+#### 触发方式一览
+
+| 测试层 | 触发时机 | 触发者 | 命令 |
+|-------|---------|-------|------|
+| Build + TypeCheck | 每次 push/PR | GitHub Actions CI (`ci.yml`) | `tsc --noEmit` + `npm run build` |
+| Unit Tests | 每次 push/PR | GitHub Actions CI (`ci.yml`) | `vitest run --project unit --shard=N/2` |
+| Adapter Tests | 每次 push/PR | GitHub Actions CI (`ci.yml`) | `npm run test:adapter` |
+| Bun 兼容性 | 每次 push/PR | GitHub Actions CI (`ci.yml`) | `bun vitest run --project unit` |
+| E2E Tests | push/PR 修改了浏览器相关路径时 | GitHub Actions CI (`e2e-headed.yml`) | `vitest run tests/e2e/` + 真实 Chrome |
+| Smoke Tests | 每周一 08:00 UTC 定时 + 手动 | GitHub Actions 定时调度 (`ci.yml`) | `vitest run tests/smoke/` |
+| 本地测试 | 开发者手动 | 开发者 | `npm test` / `npm run test:e2e` / `opencli doctor` |
+
+#### 四层测试架构
 
 ```
-Unit Tests (src/**/*.test.ts)
-  → 核心模块：browser, pipeline, registry, diagnostic, output
-  → 运行: npm test
+Layer 1: Build + TypeCheck（~30s，快速门禁）
+  → tsc --noEmit + npm run build
+  → 跨 3 个 OS: ubuntu + macOS + Windows
+  → 失败 → PR 直接标红，后续测试不用跑
 
-Adapter Tests (clis/**/*.test.{ts,js})  
-  → 各站点适配器逻辑测试
-  → 运行: npm run test:adapter
+Layer 2: Unit Tests（~1min，分 2 shard 并行）
+  → 核心模块: browser, pipeline, registry, diagnostic, output, extension
+  → PR: 仅 ubuntu（快速反馈）；push to main: 跨 3 OS
+  → Bun 兼容性检查: 同一套 unit test 在 Bun 运行时下跑一遍
 
-E2E Tests (tests/e2e/*.test.ts)
-  → 子进程运行真实 CLI，覆盖公开/浏览器/认证/管理/输出格式
-  → 站点不稳定时 warn + pass（不让偶发网络问题阻断 CI）
+Layer 3: E2E Tests（~5-10min，真实 Chrome + 真实网站）
+  → 子进程启动 opencli → 打开真实 Chrome → 访问真实网站 → 检查输出
+  → Linux 用 xvfb-run 虚拟显示器
+  → 路径过滤: 仅 extension/**, src/browser/**, src/daemon.ts 等修改时触发
 
-Smoke Tests (tests/smoke/*.test.ts)
-  → 外部 API 可用性 + 全量 adapter 校验 + 命令注册完整性
+Layer 4: Smoke Tests（~15min，定时调度）
+  → 外部 API 可用性检查（hackernews/v2ex 等 API 还活着吗）
+  → 全量 adapter 定义校验（调用 Validation Harness）
+  → 命令注册完整性（17 个站点是否都在）
 ```
 
-**CI 策略**: 单元测试分 2 shard 并行；E2E 使用真实 Chrome + xvfb-run；Smoke 定时调度运行。
+#### 具体例子：PR 修改了 `src/browser/dom-snapshot.ts`
 
-**Testing 与其他 Harness 的配合**:
-- Validation Harness（5.4）是测试的前置门禁 — 静态校验不通过的命令不会进入 E2E
-- AutoResearch（6.1）的 `guard` 字段通常就是 `npm run build` 或 `npm test`
-- Verified Generation（4.5）的 `assessResult()` 本质上是一次内嵌的 smoke test
+假设开发者修改了浏览器快照逻辑，提了一个 PR 到 `main` 分支。
+
+**自动触发链路**:
+
+```
+开发者提交 PR (修改 src/browser/dom-snapshot.ts)
+  │
+  ├─ ci.yml 自动触发:
+  │   ├─ build job ────── tsc --noEmit + npm run build (3 OS)     ✓ 每次都跑
+  │   ├─ unit-test job ── vitest --shard=1/2 + --shard=2/2        ✓ 每次都跑
+  │   ├─ adapter-test ─── npm run test:adapter                     ✓ 每次都跑
+  │   ├─ bun-test ─────── bun vitest run                           ✓ 每次都跑
+  │   └─ smoke-test ───── ✗ 不触发（仅 schedule/dispatch）
+  │
+  └─ e2e-headed.yml 自动触发（因 paths 匹配 src/browser/**）:
+      └─ e2e-headed job:
+          ├─ Setup Chrome（安装真实 Chrome 浏览器）
+          ├─ npm run build
+          └─ xvfb-run vitest run tests/e2e/
+              ├─ public-commands.test.ts ── apple-podcasts/hackernews/v2ex（纯 API）
+              ├─ browser-public.test.ts ─── bilibili/zhihu/IMDb（真实浏览器）
+              ├─ browser-auth.test.ts ───── 需登录的命令
+              ├─ management.test.ts ─────── list/validate/help
+              └─ output-formats.test.ts ── json/table/csv 格式
+```
+
+**E2E 实际执行过程**（以 B 站热门为例）:
+
+```typescript
+// tests/e2e/browser-public.test.ts
+it('bilibili hot returns video entries', async () => {
+  // 1. 启动子进程运行真实 CLI
+  const result = await runCli(['bilibili', 'hot', '--limit', '5', '-f', 'json'], { timeout: 60_000 });
+  // 内部实际执行: node dist/src/main.js bilibili hot --limit 5 -f json
+  // → 启动真实 Chrome → 打开 bilibili.com → 通过 Browser Bridge 抓数据
+
+  // 2. 环境问题优雅降级（不阻断 CI）
+  if (isBrowserBridgeUnavailable(result)) {
+    console.warn('skipped — Browser Bridge unavailable');
+    return;
+  }
+
+  // 3. 验证输出结构
+  const data = parseJsonOutput(result.stdout);
+  expect(data.length).toBe(5);
+  expect(data[0]).toHaveProperty('title');
+});
+```
+
+**E2E 核心设计 — 优雅降级**:
+
+```typescript
+// 站点不稳定时 warn + pass，不让偶发问题阻断 CI
+function expectDataOrSkip(data: any[] | null, label: string) {
+  if (data === null) {
+    console.warn(`${label}: skipped — likely bot detection or geo-blocking`);
+    return;  // ← warn 但测试通过
+  }
+  expect(data.length).toBeGreaterThanOrEqual(1);
+}
+
+// 瞬态浏览器断连自动重试一次
+async function runCliWithTransientRetry(args, timeout) {
+  let result = await runCli(args, { timeout });
+  if (result.code !== 0 && isTransientBrowserDetach(result)) {
+    result = await runCli(args, { timeout });  // 重试
+  }
+  return result;
+}
+```
+
+**E2E 路径过滤** (`e2e-headed.yml`): 如果 PR 只改了 `src/analysis.ts`（不在 paths 列表中），E2E 不会被触发，节省 CI 资源。触发路径包括：
+- `extension/**` / `src/browser/**` / `src/daemon.ts` / `src/execution.ts`
+- `src/interceptor.ts` / `tests/e2e/**` / `tests/smoke/**`
+
+**Smoke Tests（本次 PR 不触发，每周一自动跑）**:
+
+```typescript
+// tests/smoke/api-health.test.ts
+// 1. 外部 API 可用性
+it('hackernews API is responsive', async () => {
+  const { stdout, code } = await runCli(['hackernews', 'top', '--limit', '5', '-f', 'json']);
+  expect(code).toBe(0);
+  expect(data[0]).toHaveProperty('title');
+  expect(data[0]).toHaveProperty('score');
+});
+
+// 2. 全量 adapter 定义校验（复用 Validation Harness）
+it('all adapter definitions are valid', async () => {
+  const { stdout, code } = await runCli(['validate']);
+  expect(code).toBe(0);
+  expect(stdout).toContain('PASS');
+});
+
+// 3. 命令注册完整性（17 个站点是否都在）
+it('all expected sites are registered', async () => {
+  const data = parseJsonOutput(stdout);
+  const sites = new Set(data.map(d => d.site));
+  for (const expected of ['hackernews','bilibili','zhihu','twitter',...]) {
+    expect(sites.has(expected)).toBe(true);
+  }
+});
+```
+
+#### CI 策略细节
+
+| 策略 | 实现 |
+|------|------|
+| PR 快速反馈 | 单元测试仅 ubuntu（不跨 OS） |
+| main 全面覆盖 | push 后跨 3 OS + Bun 兼容 |
+| E2E 按需触发 | paths 过滤，只在浏览器相关文件变更时跑 |
+| Smoke 定时调度 | `cron: '0 8 * * 1'`，每周一 08:00 UTC |
+| 并发控制 | `cancel-in-progress: true`，同分支新 push 取消旧 CI |
+| 站点不稳定容忍 | E2E 中 warn + pass（不阻断 CI） |
+| 瞬态重试 | `isTransientBrowserDetach()` 检测到断连后自动重试一次 |
+
+#### Testing Harness 与其他 Harness 的配合
+
+```
+Validation Harness (5.4)
+  └─ 被 Smoke Test 调用: opencli validate → PASS/FAIL
+       → 静态校验不通过的适配器不会进入 E2E
+
+AutoResearch (6.1)
+  └─ guard 字段通常是 npm run build 或 npm test
+       → Testing Harness 充当 AutoResearch 的"判分标准"
+
+Verified Generation (4.5)
+  └─ assessResult() 本质上是一次内嵌的 mini smoke test
+       → 验证生成的适配器能否返回有效数据
+
+Self-Repair (5.3)
+  └─ 修复后重试命令 = 一次隐式的 E2E 验证
+```
 
 ---
 
