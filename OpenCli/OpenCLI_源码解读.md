@@ -888,26 +888,123 @@ bounded repair: select/itemPath replacement once
 
 ### 4.6 Phase 6: Persist & Register — 产物持久化
 
-验证通过后，将候选转化为可执行适配器：
+**实现**: `src/generate-verified.ts` 中的 `candidateToJs()`（:479）+ `registerVerifiedAdapter()`（:554）+ `writeVerifiedArtifact()`（:565）
+
+**核心**: 把验证通过的候选 YAML 对象变成用户可以直接用的 CLI 命令。做三件事：**编译（YAML → JS）→ 写磁盘 → 注册到内存**。
+
+#### 具体例子：知乎热榜适配器持久化
+
+Phase 4 验证通过后，内存中的候选对象是：
+
+```typescript
+candidate = {
+  site: 'zhihu', name: 'hot', description: 'Zhihu hot topics',
+  domain: 'zhihu.com', strategy: 'cookie', browser: true,
+  args: { limit: { type: 'int', default: 20 } },
+  columns: ['title', 'url', 'heat'],
+  pipeline: [
+    { fetch: "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=20" },
+    { select: "data.items" },
+    { map: { title: "target.title", url: "target.link.url", heat: "detail_text" } },
+  ],
+}
+```
+
+**Step 1: 编译** — `candidateToJs()` 把候选对象转为标准 JS 适配器代码：
+
+```javascript
+// candidateToJs() 生成的文件内容 — 和手写适配器格式完全一样
+import { cli, Strategy } from '@jackwener/opencli/registry';
+
+cli({
+  site: 'zhihu',
+  name: 'hot',
+  description: 'Zhihu hot topics',
+  domain: 'zhihu.com',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  args: [
+    { name: 'limit', type: 'int', default: 20 },
+  ],
+  columns: ['title', 'url', 'heat'],
+  pipeline: [
+    { fetch: 'https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=20' },
+    { select: 'data.items' },
+    { map: { title: 'target.title', url: 'target.link.url', heat: 'detail_text' } },
+  ],
+});
+```
+
+编译过程中 `candidateToJs()` 处理的细节：
+- strategy 字符串 `'cookie'` → 枚举 `Strategy.COOKIE`
+- browser 标志自动推断（`detectBrowserFlag()`）
+- 字符串中的引号/反斜杠/换行正确转义
+- args 对象 → 数组格式 `[{ name, type, default }]`
+
+**Step 2: 写入磁盘** — 两个文件
 
 ```
-writeAdapter():
-  1. 将 YAML pipeline 编译为 .js 文件
-  2. 写入 ~/.opencli/clis/<site>/<name>.js
-  3. 生成 .meta.json sidecar 元数据文件:
-     {
-       generated_at: ISO timestamp,
-       source_url: 原始 URL,
-       strategy: 使用的认证策略,
-       explore_dir: explore 产物路径,
-       verified: true/false,
-       repair_attempted: true/false
-     }
-  4. registerCommand() → 注册到内存中的 registry
-  5. 下次启动时，discoverClis(USER) 会从 ~/.opencli/clis/ 发现并加载
+~/.opencli/clis/zhihu/
+  ├── hot.js              ← 可执行适配器（上面的 JS 代码）
+  └── hot.meta.json       ← 元数据 sidecar
 ```
 
-**`--no-register` 选项**: 只验证不注册，用于测试生成质量。
+```typescript
+// generate-verified.ts:554-562 — registerVerifiedAdapter
+const siteDir = path.join(USER_CLIS_DIR, candidate.site);  // ~/.opencli/clis/zhihu/
+await fs.promises.mkdir(siteDir, { recursive: true });
+await fs.promises.writeFile(adapterPath, candidateToJs(candidate));   // hot.js
+await fs.promises.writeFile(metadataPath, JSON.stringify(metadata));  // hot.meta.json
+```
+
+**元数据文件 `hot.meta.json` 内容**:
+
+```json
+{
+  "artifact_kind": "verified",
+  "schema_version": 1,
+  "source_url": "https://www.zhihu.com/hot",
+  "goal": "获取知乎热榜",
+  "strategy": "cookie",
+  "verified": true,
+  "reusable": true,
+  "reusability_reason": "verified-artifact"
+}
+```
+
+元数据记录了这个适配器的"出生证明"：从哪个 URL 生成、用户目标是什么、用了什么策略、是否通过验证。后续 Self-Repair（5.3）读取 `source` 字段定位适配器源码。
+
+**Step 3: 注册到内存** — `registerCommand()`
+
+```typescript
+// candidateToCommand() 转为 CliCommand，然后注册
+registerCommand(candidateToCommand(candidate, adapterPath));
+// → 注册到 globalThis.__opencli_registry__
+// → 当前进程内立即可用
+```
+
+`candidateToCommand()` 把候选转为 `CliCommand` 结构（和内建命令格式一致），`registerCommand()` 写入全局单例 registry。
+
+**注册后立即可用**:
+
+```bash
+# 刚 generate 完，当前进程内已注册，立即可用
+opencli zhihu hot --limit 5 -f json
+
+# 下次启动时的加载链路:
+# main.ts → discoverClis(USER) → 扫描 ~/.opencli/clis/
+# → 发现 zhihu/hot.js → import() 加载 → cli() 自动注册
+# → opencli zhihu hot 可用
+```
+
+#### 两种写入模式
+
+| 模式 | 触发方式 | 写入路径 | 是否注册 |
+|------|---------|---------|:---:|
+| 默认 | `opencli generate <url>` | `~/.opencli/clis/<site>/<name>.js` | 是 |
+| `--no-register` | `opencli generate <url> --no-register` | `.opencli/explore/<site>/verified/<name>.verified.js` | 否 |
+
+`--no-register` 模式用于测试生成质量 — 只编译和存档到 explore 产物目录，不注册为可用命令，不污染用户的命令空间。
 
 ---
 
