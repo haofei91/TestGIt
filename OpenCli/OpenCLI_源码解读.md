@@ -723,36 +723,166 @@ const maxIdx = CASCADE_ORDER.indexOf(Strategy.HEADER); // 默认最多探测到 
 
 ### 4.5 Phase 4-5: Verify & Bounded Repair — 质量评估与修复
 
-**验证阶段**:
+**实现**: `src/generate-verified.ts` 中的 `verifyCandidate()`（:440）+ `assessResult()`（:357）+ `withItemPath()`（:379）
 
-将 Cascade 确定的策略写入候选 YAML，然后通过 Pipeline 引擎实际执行：
+#### 具体例子：知乎热榜候选验证
 
-```
-verifyCandidate():
-  1. 将 bestStrategy 注入候选 pipeline
-  2. executePipeline(candidate) — 使用 src/pipeline/ 引擎执行
-  3. assessResult(output):
-     - 非数组 → 失败 (non-array-result)
-     - 空数组 → 失败 (empty-result)
-     - 字段过少 → 失败 (sparse-fields)
-     - 通过 → success
-```
+假设 Phase 1-3 生成了如下候选：
 
-**有界修复（Bounded Repair）**:
-
-首次验证失败且原因为 `empty-result` 时，系统会尝试**一次**自动修复：
-
-```
-Verify 失败 (empty-result)
-  → 检查是否有备选 itemPath
-  → 替换 pipeline 中的 select 路径
-  → 重新执行 pipeline
-  → 再次 assessResult()
-  → 成功 → 继续 Persist
-  → 仍然失败 → 输出 needs-human-check
+```yaml
+site: zhihu
+name: hot
+strategy: COOKIE
+pipeline:
+  - fetch: "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=20"
+  - select: "data"
+  - map: { title: "target.title", url: "target.link.url", heat: "detail_text" }
 ```
 
-修复预算严格限定为 **1 次 itemPath 替换**，不做更复杂的修改。这是 v1 合约的设计约束。
+#### Phase 4: Verify — 真的跑一遍候选 pipeline
+
+`verifyCandidate()` 在**当前浏览器页面**中，用 Pipeline 引擎**真实执行**这个候选 YAML：
+
+```typescript
+// generate-verified.ts:440-449
+async function verifyCandidate(page, candidate, expectedFields) {
+  const result = await executePipeline(page, candidate.pipeline, {
+    args: buildDefaultArgs(candidate),
+  });
+  return assessResult(result, expectedFields);
+}
+```
+
+然后用 `assessResult()` 对执行结果做 **4 道质量检查**：
+
+```typescript
+// generate-verified.ts:357-377
+function assessResult(result, expectedFields) {
+  // 检查 1: 结果是数组吗？
+  if (!Array.isArray(result))       → { ok: false, reason: 'non-array-result' }
+
+  // 检查 2: 数组非空吗？
+  if (result.length === 0)          → { ok: false, reason: 'empty-result' }
+
+  // 检查 3: 第一条记录的有效字段 >= 2 个？
+  //   (排除 null / undefined / '' 后的字段数)
+  if (populated.length < 2)         → { ok: false, reason: 'sparse-fields' }
+
+  // 检查 4: 期望字段至少匹配一个？
+  if (expectedFields 有值 && 无匹配) → { ok: false, reason: 'sparse-fields' }
+
+  return { ok: true };              // 全部通过
+}
+```
+
+**知乎例子 — 验证成功路径**:
+```
+pipeline 执行返回:
+  [{ title: "如何看待...", url: "https://...", heat: "2300万热度" }, ...共20条]
+
+assessResult:
+  ✓ 是数组
+  ✓ 非空 (20 条)
+  ✓ 有效字段 3 个 (>= 2)
+  → ok: true → 直接进 Phase 6 Persist
+```
+
+#### 验证失败时的异常处理
+
+`verifyCandidate()` 对不同类型的执行异常做分类处理：
+
+| 异常类型 | 判定 | 是否尝试修复 |
+|---------|------|:---:|
+| `BrowserConnectError` | `blocked` — 浏览器不可用 | 否，直接停止 |
+| `AuthRequiredError` | `blocked` — 认证过于复杂 | 否，直接停止 |
+| `SelectorError` | `needs-human-check` — 选择器不匹配 | 否 |
+| `TimeoutError` | `needs-human-check` — 执行超时 | 否 |
+| `CommandExecutionError` | `needs-human-check` — 执行出错 | 否 |
+| 结果非数组 (`non-array-result`) | 非 terminal 失败 | 否 |
+| 结果字段过少 (`sparse-fields`) | 非 terminal 失败 | 否 |
+| **结果为空数组** (`empty-result`) | 非 terminal 失败 | **是 — 进入 Bounded Repair** |
+
+#### Phase 4.5: Bounded Repair — 仅对 empty-result 尝试换路径
+
+**触发条件极其严格**: 只有 `reason === 'empty-result'` 且 Explore 阶段记录了备选 `itemPath` 时才修复。
+
+**知乎例子 — 需要修复的路径**:
+
+```
+假设知乎 API 真实返回:
+{
+  "data": {                    ← select: "data" 取到的是对象，不是数组
+    "items": [                 ← 真正的数组在 data.items
+      { "target": { "title": "..." }, "detail_text": "2300万热度" },
+      ...
+    ]
+  }
+}
+
+第一次 verify: select: "data" → 取到对象 → map 失败 → 结果为空数组
+assessResult → reason: 'empty-result'
+```
+
+**`withItemPath()` 做的事**（替换 select 路径）:
+
+```typescript
+// generate-verified.ts:379-389
+function withItemPath(candidate, itemPath) {
+  if (!itemPath) return null;                    // 没有备选路径 → 放弃
+  if (current.select === itemPath) return null;  // 和当前一样 → 放弃
+  next.pipeline[selectIndex] = { select: itemPath }; // 替换！
+  return next;
+}
+```
+
+```
+Explore 阶段的 endpoint 记录: itemPath = "data.items"（findArrayPath 发现的）
+当前 candidate: select: "data"
+  → 不同 → 替换为 select: "data.items"
+  → 第二次 verifyCandidate()
+
+第二次结果:
+  [{ title: "如何看待...", heat: "2300万热度" }, ...共20条]
+  → assessResult: ok: true
+  → 修复成功！写入时标记 repair_attempted: true
+```
+
+#### 完整决策树
+
+```
+verifyCandidate(candidate)
+  │
+  ├─ ok: true ───────────────→ Phase 6: Persist（status: 'success'）
+  │
+  ├─ blocked ────────────────→ 直接停止（status: 'blocked'）
+  │   (浏览器不可用 / 需登录)    不尝试修复
+  │
+  ├─ needs-human-check ──────→ 直接停止（status: 'needs-human-check'）
+  │   (Selector / Timeout       不尝试修复
+  │    / 执行异常)
+  │
+  └─ 非 terminal 失败:
+      ├─ non-array-result ───→ 不修复 → needs-human-check
+      ├─ sparse-fields ──────→ 不修复 → needs-human-check
+      └─ empty-result ───────→ Bounded Repair:
+          │
+          ├─ 有备选 itemPath 且不同？
+          │   ├─ 否 → 放弃 → needs-human-check
+          │   └─ 是 → 替换 select → 第二次 verify
+          │       ├─ ok: true → Persist（repair_attempted: true）
+          │       └─ 失败 → needs-human-check
+          │
+          └─ 修复预算: 严格 1 次，绝不做第三次
+```
+
+#### 为什么修复只限 1 次 itemPath 替换？
+
+这是 v1 合约的刻意约束（`generate-verified.ts:9`）：
+```
+bounded repair: select/itemPath replacement once
+```
+
+设计哲学：如果换一条 JSON 路径都救不回来，说明问题不在路径选择上（可能是 API 需要登录、需要特殊参数、或返回结构完全不同）。这种情况交给人（`needs-human-check`）或 Agent（Self-Repair，见 5.3）处理更合适，而不是在确定性流程里盲目尝试更多修复。
 
 ---
 
