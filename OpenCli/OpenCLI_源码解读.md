@@ -2384,6 +2384,225 @@ func: async (page, kwargs) => {
 
 **核心结论**：CLI `generate` 是确定性规则引擎，覆盖 PUBLIC + COOKIE + 标准 JSON API；一旦涉及 **自定义 Header 构造、前端框架交互、请求拦截、分页参数、共享逻辑抽取、结构化错误处理** — 这些都超出确定性规则的表达能力，必须由 Agent 读取 Skill 文档后手动实现。Skill 不是"备选方案"，而是 CLI 设计之初就规划好的 **能力边界分工**：确定性的交给代码，需要判断力的交给 Agent + Skill。
 
+### 7.5 "修改代码后自动测试" — 贯穿全系统的统一模式
+
+OpenCLI 中有 **四个独立机制** 都实现了"改完代码 → 自动测试"，但触发时机、测试内容、判定标准各不相同。
+
+#### 全景对比
+
+```
+                       修改发生             自动测试              判定结果
+                     ─────────           ─────────           ─────────
+机制 1 (Verified)    generate 生成候选    verifyCandidate()    success / blocked / needs-human-check
+机制 2 (AutoRes)     Agent 改源码        runVerify()          keep(指标涨) / discard(回滚)
+机制 3 (Self-Repair) Agent 修适配器      重新执行原命令        成功 / 失败(3轮后停止)
+机制 4 (CI)          git push / PR       GitHub Actions VM    绿(通过) / 红(阻断 merge)
+```
+
+---
+
+#### 机制 1：Verified Generation — 生成后立即验证
+
+**触发时机**：`opencli generate <url>` 在 Phase 3（synthesize 生成候选 YAML）之后，自动进入 Phase 4 验证。
+
+**源码位置**：`src/generate-verified.ts:786-867`
+
+**流程**：
+
+```
+synthesize 生成候选 YAML
+  │
+  ▼
+第一次验证: verifyCandidate(page, candidate, expectedFields)
+  │ └─ 内部: executePipeline() 执行候选的 pipeline → assessResult() 检查返回值
+  │
+  ├─ ok: true  → success，直接注册
+  ├─ terminal: 'blocked'     → 停止，报 blocked
+  ├─ terminal: 'needs-human-check' → 停止，报需要人工
+  └─ reason: 'empty-result'  → 尝试 Bounded Repair
+       │
+       ▼
+     withItemPath() 替换 select 路径
+       │
+       ▼
+     第二次验证: verifyCandidate(page, repaired, expectedFields)
+       ├─ ok → success（修复成功）
+       └─ 失败 → needs-human-check
+```
+
+**测什么**：`assessResult()` 四项检查：
+
+```typescript
+// src/generate-verified.ts:357-377
+function assessResult(result, expectedFields) {
+  if (!Array.isArray(result))   return { ok: false, reason: 'non-array-result' };  // 1. 必须是数组
+  if (result.length === 0)      return { ok: false, reason: 'empty-result' };      // 2. 不能为空
+  // 3. 第一条记录至少 2 个有值字段
+  const populated = keys.filter(key => record[key] !== null && record[key] !== undefined && record[key] !== '');
+  if (populated.length < 2)     return { ok: false, reason: 'sparse-fields' };
+  // 4. 如果指定了期望字段，至少匹配一个
+  if (expectedFields.length > 0) {
+    const matched = expectedFields.filter(field => keys.includes(field));
+    if (matched.length === 0)   return { ok: false, reason: 'sparse-fields' };
+  }
+  return { ok: true };
+}
+```
+
+**异常映射**：`verifyCandidate()` 捕获执行异常，映射为终止状态：
+
+| 异常类型 | 映射结果 | 含义 |
+|---------|---------|------|
+| `BrowserConnectError` | `blocked` | 浏览器不可用，无法继续 |
+| `AuthRequiredError` | `blocked: auth-too-complex` | 认证超出 CLI 能力 |
+| `SelectorError` | `needs-human-check: selector-mismatch` | CSS 选择器失效 |
+| `TimeoutError` | `needs-human-check: timeout` | 页面加载超时 |
+| 其他 | `needs-human-check: verify-inconclusive` | 未知错误 |
+
+**关键设计**：最多修复一次（Bounded Repair），且只针对 `empty-result` + `itemPath` 可用的情况。这是刻意保守 — 多轮修复的复杂度交给 Agent + Skill。
+
+---
+
+#### 机制 2：AutoResearch — 每轮迭代后度量
+
+**触发时机**：开发者运行 `npx tsx autoresearch/commands/run.ts --preset browser-reliability`，Engine 主循环中每次 Agent（modify callback）改完代码后。
+
+**源码位置**：`autoresearch/engine.ts:290-339`
+
+**流程**：
+
+```
+每轮迭代:
+  Agent 修改代码 (modify callback)
+    │
+    ▼
+  git add + commit (Phase 4，只提交 scope 内文件)
+    │
+    ▼
+  runVerify() (Phase 5)
+    │ └─ 执行 config.verify 命令（如 npx tsx autoresearch/eval-browse.ts）
+    │ └─ extractMetric() 从输出中解析数字（如 SCORE=56/59 → 56）
+    │
+    ├─ metric == null → verify crashed，safeRevert() 回滚
+    │
+    ▼
+  与 bestMetric 比较
+    │
+    ├─ improved + delta >= minDelta → runGuard()（Phase 5.5）
+    │   ├─ guard pass → status = 'keep'，更新 bestMetric
+    │   └─ guard fail → safeRevert()，status = 'discard'
+    │
+    └─ not improved → safeRevert()，status = 'discard'
+```
+
+**测什么**：取决于 preset 配置，以 `browser-reliability` 为例：
+
+```
+verify 命令: npx tsx autoresearch/eval-browse.ts
+  → 读取 browse-tasks.json（~59 个浏览器操作任务）
+  → 逐个执行任务的 steps（open/click/network/eval）
+  → 用 criteria 评判每个任务是否通过
+  → 输出 SCORE=51/59
+
+guard 命令: npm run build && npm test
+  → TypeScript 编译通过 + 单元测试通过
+```
+
+**双重保险**：verify 看"功能有没有变好"，guard 看"基本功能有没有被破坏"。只有两个都通过才 keep。
+
+---
+
+#### 机制 3：Self-Repair — 修复后重跑原命令
+
+**触发时机**：Agent 使用 `opencli-autofix` Skill 修复一个失败的适配器后。
+
+**源码位置**：由 Skill 驱动（`skills/opencli-autofix/SKILL.md`），CLI 侧提供 Diagnostic 输出（`src/diagnostic.ts` + `src/execution.ts:228-234`）。
+
+**流程**：
+
+```
+用户命令失败: opencli zhihu hot → 报错
+  │
+  ▼
+Agent 按 Skill 指导收集诊断:
+  OPENCLI_DIAGNOSTIC=1 opencli zhihu hot 2>diagnostic.json
+  │
+  │ CLI 内部 (execution.ts:228-234):
+  │   catch (err) {
+  │     if (isDiagnosticEnabled()) {
+  │       const ctx = await collectDiagnostic(err, cmd, page);  // 收集错误+源码+浏览器状态
+  │       emitDiagnostic(ctx);  // 输出到 stderr: ___OPENCLI_DIAGNOSTIC___ JSON
+  │     }
+  │   }
+  │
+  ▼
+Agent 读 RepairContext JSON → 定位问题 → 修改适配器源码
+  │
+  ▼
+Agent 重新运行原命令: opencli zhihu hot
+  ├─ 成功 → 修复完成，可选提 GitHub Issue
+  └─ 失败 → 回 Step 1 重新诊断（最多 3 轮）
+```
+
+**测什么**：Diagnostic 输出的 `RepairContext` 包含：
+
+| 字段 | 内容 | 大小限制 |
+|------|------|---------|
+| `error` | 错误类型 + 消息 + exitCode | - |
+| `adapter.source` | 适配器完整源码 | 50,000 字符 |
+| `page.snapshot` | DOM 快照（简化 HTML） | 100,000 字符 |
+| `page.network` | 网络请求列表（已脱敏） | 最多 50 条 |
+| `page.console` | 浏览器 console 错误 | - |
+| 总量 | 全部 JSON | **256 KB** |
+
+重跑原命令就是最直接的测试 — 能拿到正确数据就算通过。
+
+---
+
+#### 机制 4：CI Testing — push 后自动跑测试套件
+
+**触发时机**：`git push` 或 PR 到 GitHub，由 GitHub Actions 自动触发。
+
+**源码位置**：`.github/workflows/ci.yml` + `e2e-headed.yml`
+
+**已在 6.2 节详述**，这里只列关键对比点：
+
+| 层级 | 测什么 | 何时触发 |
+|------|--------|---------|
+| Unit Tests | 纯逻辑函数 | 每次 push/PR |
+| Adapter Tests | 适配器定义合法性 | 每次 push/PR |
+| E2E Tests | 浏览器端到端命令 | PR 且改了 browser 相关文件 |
+| Smoke Tests | 外部 API 可用性 + 注册表完整性 | 每周一 08:00 UTC |
+
+---
+
+#### 四个机制的统一模式
+
+虽然实现各异，但都遵循同一个抽象模式：
+
+```
+修改（Modify）→ 执行（Execute）→ 度量（Measure）→ 判定（Decide）→ 反馈（Feedback）
+```
+
+| | Verified Gen | AutoResearch | Self-Repair | CI |
+|---|:---:|:---:|:---:|:---:|
+| **谁修改** | CLI synthesize | Agent (Claude) | Agent (按 Skill) | 开发者 |
+| **谁触发测试** | CLI 自动 | Engine 自动 | Agent 手动重跑 | GitHub Actions 自动 |
+| **执行什么** | executePipeline() | config.verify 命令 | 原始 opencli 命令 | npm test / vitest |
+| **度量什么** | assessResult() 4 项检查 | extractMetric() 数值 | 命令是否成功 | 测试通过率 |
+| **判定标准** | ok / blocked / escalate | metric 涨且 guard 通过 | 返回正确数据 | 全绿 |
+| **失败后果** | bounded repair 或上报 | git revert 回滚 | 重新诊断(3轮) | 阻断 merge |
+| **代码位置** | generate-verified.ts | engine.ts | Skill + diagnostic.ts | .github/workflows/ |
+
+**为什么 OpenCLI 需要四个而不是一个？** 因为它们覆盖的**生命周期阶段不同**：
+
+```
+适配器生命周期:
+  诞生 ──────────── 成长 ──────────── 维护 ──────────── 持续集成
+  Verified Gen      AutoResearch      Self-Repair       CI Testing
+  "生成的能用吗？"  "改了有没有更好？"  "坏了能修好吗？"   "整体没退步吧？"
+```
+
 ---
 
 ## 八、Harness 理念的统一框架
