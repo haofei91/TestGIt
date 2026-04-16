@@ -43,14 +43,14 @@
 | 维度 | CLI-Anything | OpenCLI |
 |------|:---:|:---:|
 | **目标** | GUI 软件 → CLI（GIMP、Blender、LibreOffice...） | 网站/App → CLI（Twitter、知乎、B 站...） |
-| **生成者** | AI Agent（Claude Code）按 HARNESS.md 生成 | CLI 代码自动生成（`opencli generate`） |
+| **生成者** | AI Agent（Claude Code）按 HARNESS.md 生成 | 双模式：`opencli generate` 代码自动生成 + `opencli-explorer` Skill 文档教 Agent 手动生成 |
 | **后端** | 真实软件（subprocess 调用） | 浏览器 + HTTP API |
 | **运行时 LLM** | 生成时需要大模型，运行时不需要 | 全程不需要 LLM |
 | **产物语言** | Python（Click 框架） | TypeScript（cli() API） |
 | **测试方式** | Agent 本地跑 pytest（依赖真实软件） | CI 自动跑（GitHub Actions） |
 | **Harness 含义** | SOP 文档（教 Agent 怎么做） | 代码模块（CLI 自己执行的验证循环） |
 
-**一句话对比**：OpenCLI 是"代码写代码"，CLI-Anything 是"文档教 Agent 写代码"。
+**一句话对比**：OpenCLI 是"代码自动生成 + Skill 文档教 Agent 手动补充"的双模式，CLI-Anything 是纯"文档教 Agent 写代码"的单模式。两者在 Skill 层都选择了文档驱动，区别在于 OpenCLI 多了一条不依赖 Agent 的代码自动化路径。
 
 ---
 
@@ -129,7 +129,7 @@ HARNESS.md（592 行）是整个项目的"宪法"。所有插件命令（`/cli-a
 | Directory Structure | 标准目录结构模板 | ~30 行 |
 | Testing Strategy | 四层测试方法论 | ~70 行 |
 
-**关键角色**：HARNESS.md 在 CLI-Anything 中的地位等价于 OpenCLI 中 `generate-verified.ts`（代码强制验证流程），只是一个用文档约束 Agent，一个用代码约束执行。
+**关键角色**：HARNESS.md 在 CLI-Anything 中的地位等价于 OpenCLI 中 `generate-verified.ts`（代码强制验证流程）的自动路径，只是一个用文档约束 Agent，一个用代码约束执行。但值得注意的是，OpenCLI 的 `opencli-explorer` Skill 同样是文档驱动的 — 当自动路径失败时，Agent 会读 SKILL.md 并按文档指引手动操作，这一层面两个项目思路一致。
 
 ### 3.2 插件命令系统（commands/）
 
@@ -984,14 +984,19 @@ cli-hub install gimp
 CLI-Anything 最核心的设计决策：**用文档而非代码约束 Agent 行为**。
 
 ```
-OpenCLI:        代码约束 → Agent 调 CLI，CLI 内部确定性执行
-                generate-verified.ts 保证 explore→cascade→verify 顺序
+OpenCLI 自动路径:  代码约束 → Agent 调 CLI，CLI 内部确定性执行
+                   generate-verified.ts 保证 explore→cascade→verify 顺序
 
-CLI-Anything:   文档约束 → Agent 读 HARNESS.md，按 SOP 自己执行
-                HARNESS.md 保证 analyze→design→implement→test 顺序
+OpenCLI Skill路径: 文档约束 → Agent 读 SKILL.md，按决策树手动操作
+                   opencli-explorer 教 Agent 用 opencli browser 探索 API
+
+CLI-Anything:      文档约束 → Agent 读 HARNESS.md，按 SOP 自己执行
+                   HARNESS.md 保证 analyze→design→implement→test 顺序
 ```
 
-**为什么选择文档而非代码**？因为 CLI-Anything 的目标软件种类繁多（3D/音频/视频/图表/办公...），每个软件的 Phase 1（分析）和 Phase 3（实现）完全不同。无法用一段确定性代码覆盖 44 款软件 — 只能用文档教 Agent 如何灵活处理。
+**注意**：OpenCLI 并非纯"代码约束"。当自动生成（`opencli generate`）失败或面对复杂站点时，Agent 会走 Skill 路径 — 读 `opencli-explorer` SKILL.md，按文档指引手动用 `opencli browser` 命令探索 API 并编写适配器。这一路径本质上与 CLI-Anything 的"文档教 Agent"模式相同。
+
+**为什么选择文档而非代码**？因为 CLI-Anything 的目标软件种类繁多（3D/音频/视频/图表/办公...），每个软件的 Phase 1（分析）和 Phase 3（实现）完全不同。无法用一段确定性代码覆盖 44 款软件 — 只能用文档教 Agent 如何灵活处理。而 OpenCLI 面对类似的多样性问题（复杂站点无法自动生成），同样选择了文档驱动的 Skill 作为补充。
 
 ### 8.3 硬依赖原则 — 不降级
 
@@ -1027,7 +1032,7 @@ Agent 不需要一次读完所有指南 — 每个指南在 HARNESS.md 中通过
 |------|-------------|---------|
 | **定位** | GUI 软件 → CLI | 网站/App → CLI |
 | **核心文件** | HARNESS.md (592 行 Markdown) | generate-verified.ts (973 行 TypeScript) |
-| **生成方式** | Agent 按文档手工生成 | CLI 代码自动生成 |
+| **生成方式** | Agent 按文档手工生成（纯文档驱动） | 双模式：代码自动生成 + Skill 文档教 Agent 手动生成 |
 | **产物语言** | Python (Click) | TypeScript (cli() API) |
 | **后端** | 真实 GUI 软件 (subprocess) | 浏览器 + HTTP API (CDP) |
 | **认证** | 不涉及（本地软件） | 5 级 Tier 策略（PUBLIC→UI） |
@@ -1044,8 +1049,9 @@ Agent 不需要一次读完所有指南 — 每个指南在 HARNESS.md 中通过
 **根本差异的一句话总结**：
 
 ```
-OpenCLI:      确定性代码 → 可以用代码验证代码 → 代码驱动一切
-CLI-Anything: 多样性软件 → 无法用代码覆盖所有情况 → 文档驱动 Agent
+OpenCLI:      确定性代码自动生成 + Skill 文档兜底 → 双模式混合驱动
+CLI-Anything: 多样性软件无法用代码覆盖所有情况 → 纯文档驱动 Agent
+共同点:       两者在 Skill 层都选择了"文档教 Agent"，本质相同
 ```
 
 ---
