@@ -1074,9 +1074,25 @@ npx tsx autoresearch/commands/run.ts --goal "..." --verify "..." --scope "src/*.
 | 综合改进 | `combined` | 多维度综合可靠性提升 |
 | 自定义任意模块优化 | 无（通过 CLI 参数） | 开发者自定义 goal/scope/verify |
 
-#### Engine 与 Agent 的分工
+#### Engine 与 Agent 的分工 — AutoResearch 必须依赖 Agent
 
-`Engine` 类本身只是一个**循环管理器**，真正做代码修改的是传入的 `modify` 回调。在 `commands/run.ts` 中，这个回调的实现是调用 Claude Code：
+AutoResearch **不能自主发现优化点，也不能自主修改代码**。`Engine` 类本身只是一个**循环管理器**（"考官"），所有"发现问题"和"修改代码"的智能都在 `modify` 回调中，即 Agent（"学生"）。如果没有 Agent，Engine 每轮都会记录 `no-op`，什么也不会发生。
+
+Engine 自身能力边界：
+
+| 能力 | Engine 能自己做？ | 说明 |
+|------|:---:|------|
+| git 前置检查 | 能 | `checkPreconditions()` |
+| 运行 verify 提取度量 | 能 | `runVerify()` + `extractMetric()` — 纯数值比较 |
+| 运行 guard 回归检查 | 能 | `runGuard()` — 执行 shell 命令 |
+| git commit / revert | 能 | 机械操作 |
+| 判断 keep/discard | 能 | 度量值大小比较 |
+| **发现优化点** | **不能** | 必须由 `modify` 回调（Agent）完成 |
+| **修改代码** | **不能** | 必须由 `modify` 回调（Agent）完成 |
+
+这与 Verified Generation（CLI Harness）形成鲜明对比 — CLI Harness 的 explore/synthesize/cascade/verify 全部是纯确定性规则，零 Agent 依赖；而 AutoResearch 的核心改进能力完全依赖外部 Agent。
+
+在 `commands/run.ts` 中，`modify` 回调的实现是调用 Claude Code：
 
 ```typescript
 // commands/run.ts:63 — modify 回调 = 调用 AI Agent
@@ -1193,6 +1209,149 @@ export const browserReliability: AutoResearchConfig = {
 | 度量方式 | 命令是否执行成功 | 自定义 verify 命令输出的数值 |
 | Agent 角色 | 读诊断 → 改适配器 → 重试 | 读上下文 → 构思 → 原子修改 |
 | 回滚机制 | 无（修改就保留） | `git revert`（度量未改善就回滚） |
+
+#### Skill 中不会主动触发 AutoResearch
+
+经过对所有 6 个 Skill（`opencli-autofix`、`opencli-browser`、`opencli-explorer`、`opencli-oneshot`、`opencli-usage`、`smart-search`）的 SKILL.md 源码检查，**没有任何 Skill 包含 AutoResearch 的调用逻辑**。
+
+AutoResearch 和 Skill 是**两条平行路径**：
+
+```
+面向终端用户/Agent（运行时）          面向 OpenCLI 开发者（开发时）
+──────────────────────────          ──────────────────────────
+opencli-usage       → 使用 CLI      autoresearch/run.ts → 改进 CLI 代码
+opencli-explorer    → 生成 CLI      preset: browser-reliability → 提升浏览器命令通过率
+opencli-autofix     → 修复 CLI      preset: skill-quality → 改进 SKILL.md 质量
+opencli-browser     → 浏览器操作     preset: v2ex/zhihu-reliability → 提升站点适配器可靠性
+```
+
+唯一的交集是 `skill-quality` preset：它用 AutoResearch 循环来**改进 SKILL.md 本身的质量**（让 Agent 更好地使用 Skill），但仍然是开发者手动启动，不是 Skill 运行时自动触发。
+
+#### 完整例子：browser-reliability 从 51/59 到 59/59
+
+以下用 `browser-reliability` preset 走一遍完整链路，展示人、Agent、Engine、目标程序、文件之间的协作关系。
+
+**参与角色**:
+
+```
+┌──────────┐   手动启动    ┌────────────────┐  调用 claude -p  ┌─────────────┐
+│  人（开发者）│ ──────────→ │  Engine (CLI)    │ ───────────────→ │  Agent       │
+│           │             │  循环管理器       │ ←─────────────── │ (Claude Code)│
+└──────────┘             └────────────────┘  返回修改描述     └─────────────┘
+                                 │                                     │
+                         运行 verify 命令                         读取 + 修改
+                                 ↓                                     ↓
+                         ┌────────────────┐                  ┌──────────────────┐
+                         │ 目标程序         │                  │ scope 文件        │
+                         │ eval-browse.ts  │                  │ dom-snapshot.ts   │
+                         │ 59 个测试用例    │                  │ dom-helpers.ts    │
+                         │ + 真实网站       │                  │ base-page.ts      │
+                         └────────────────┘                  │ page.ts / cli.ts  │
+                                                             └──────────────────┘
+```
+
+**Step 0 — 人启动（人的工作到此结束）**:
+```bash
+npx tsx autoresearch/commands/run.ts --preset browser-reliability
+```
+
+**Step 1 — Engine 做前置检查 + 测量 Baseline**:
+```
+git status --porcelain    → 必须干净
+运行 verify: npx tsx autoresearch/eval-browse.ts 2>&1 | tail -1
+  → eval-browse.ts 逐个执行 59 个测试用例（真实 opencli 命令 + 真实网站）
+  → 输出: SCORE=51/59
+  → extractMetric() 提取: 51
+记录: iteration=0, metric=51, status=baseline
+```
+
+**测试用例示例**（`browse-tasks.json`）:
+```json
+{
+  "name": "extract-github-stars",
+  "steps": [
+    "opencli browser open https://github.com/browser-use/browser-use",
+    "opencli browser eval \"document.querySelector('#repo-stars-counter-star')?.textContent?.trim()\""
+  ],
+  "judge": { "type": "matchesPattern", "pattern": "\\d" }
+}
+```
+
+**Step 2 — 迭代 1: Engine 传上下文给 Agent**:
+
+Engine 构建 prompt 传给 Claude Code：
+```
+Goal: Increase browser command pass rate to 59/59 (100%)
+Metric (pass_count): 51 (best: 51)
+Iteration: 1
+Scope: src/browser/dom-snapshot.ts, dom-helpers.ts, base-page.ts, page.ts, cli.ts
+Rules: Make ONE atomic change, read failing tests BEFORE modifying, DO NOT modify test files
+```
+
+**Step 3 — Agent 自主工作（Engine 不参与）**:
+```
+Agent 先跑一遍 eval-browse.ts 看哪些 task 失败
+  → 发现 extract-github-stars 失败: selector 找不到元素
+Agent 读 src/browser/dom-snapshot.ts
+  → 发现 snapshot 等待超时过短
+Agent 改 dom-snapshot.ts: 增加 waitForSelector 超时
+Agent 返回: "Increase snapshot wait timeout from 3s to 8s for slow-loading pages"
+```
+
+**Step 4 — Engine commit + verify + guard + 决策**:
+```
+git add -- src/browser/dom-snapshot.ts ...    ← 只 add scope 内的文件
+git commit -m "experiment(browser): Increase snapshot wait timeout from 3s to 8s"
+运行 verify → SCORE=53/59 → 度量 53, delta = +2
+运行 guard → npm run build → 成功
+判定: 53 > 51 且 |+2| >= 1 且 guard pass → KEEP ✓
+```
+
+**Step 5 — 迭代 2: 假设 Agent 的修改没有效果**:
+```
+Engine 传新上下文: bestMetric=53, recentLog=[baseline 51, keep +2]
+Agent 改了 dom-helpers.ts
+verify → SCORE=53/59 → delta = 0
+判定: 没有改善 → DISCARD ✗ → git revert HEAD --no-edit（回滚）
+```
+
+**Step N — 连续丢弃 6 次后，Engine 给 stuckHint**:
+```
+Engine 在 prompt 中追加:
+  ## STUCK — Try a Different Approach
+  Re-read ALL scope files from scratch. Try a completely different approach.
+```
+
+**最终产出**:
+
+```
+autoresearch-results.tsv            ← 每轮迭代记录（TSV 格式）
+──────────────────────────────────────────────────────────────
+iteration  commit   metric  delta  guard  status    description
+0          abc1234  51      +0     pass   baseline  initial state — pass_count 51
+1          ef01234  53      +2     pass   keep      Increase snapshot wait timeout...
+2          -        53      +0     -      discard   Adjust retry logic in dom-helpers
+3          gh56789  55      +2     pass   keep      Add fallback selector for...
+...
+N          xy98765  59      +4     pass   keep      Handle dynamic content loading...
+
+autoresearch/results/browse-001.json ← 每次 verify 的详细结果
+git history                          ← 保留的改进 commit（discard 的已被 revert）
+```
+
+**所有文件角色一览**:
+
+| 文件 | 角色 | 由谁使用 |
+|------|------|---------|
+| `autoresearch/commands/run.ts` | 入口脚本 | 人手动运行 |
+| `autoresearch/presets/browser-reliability.ts` | 配置（goal/scope/verify/guard） | Engine 读取 |
+| `autoresearch/engine.ts` | 循环骨架 | 自动运行 |
+| `autoresearch/config.ts` | 类型定义 + `extractMetric` | Engine 调用 |
+| `autoresearch/logger.ts` | TSV 日志 | Engine 写入 |
+| `autoresearch/eval-browse.ts` | 测试运行器（verify 命令） | Engine 通过 shell 执行 |
+| `autoresearch/browse-tasks.json` | 59 个测试用例定义 | eval-browse.ts 读取 |
+| `src/browser/dom-snapshot.ts` 等 | scope 文件（被优化的目标） | Agent 读取+修改 |
+| `autoresearch-results.tsv` | 迭代度量日志 | Engine 写入, Agent 读取（作为历史） |
 
 ### 6.2 Testing Harness（测试线束）
 
