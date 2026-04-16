@@ -1815,7 +1815,213 @@ Self-Repair (5.3)
 
 ---
 
-## 七、Harness 理念的统一框架
+## 七、Skill 体系 — Agent 的操作手册
+
+> CLI 是给机器用的工具，Skill 是教 Agent 如何使用这些工具的"操作手册"。CLI 能覆盖 80% 的常见场景（公开 API + Cookie 认证），Skill 负责剩下 20% 的复杂场景（签名加密、风控绕过、级联请求等）。
+
+### 7.1 为什么有了 CLI 还需要 Skill
+
+CLI（`opencli generate/explore/cascade`）有明确的 v1 合约限制：
+
+| CLI 能做的 | CLI 做不了的 |
+|-----------|------------|
+| PUBLIC / COOKIE 策略 | HEADER / INTERCEPT / UI 策略 |
+| 只读 JSON API | 需要签名的 API（小红书 X-s、B 站 wbi） |
+| 自动发现的端点 | 懒加载深层 API（需点击特定按钮才触发） |
+| 单个最佳候选 | 同站点多个命令 |
+| 模板化 pipeline | 需要自定义 `func()` 的复杂适配器 |
+| 空数组时换一次路径 | 风控伪 200、SPA 返回 HTML 等复杂失败 |
+
+**当 CLI 的确定性规则覆盖不了时，需要 Agent 介入。但 Agent 不是天生就知道怎么用 OpenCLI — 它需要 Skill 作为操作手册。**
+
+```
+CLI generate = 自动驾驶
+  → 能处理 80% 的常见路况（公开 API、Cookie 认证）
+  → 遇到复杂路况就停下来报告（blocked / needs-human-check）
+
+Skill = 驾校教材
+  → 教 Agent 如何处理自动驾驶搞不定的复杂路况
+  → 签名加密怎么绕、风控怎么判断、分页怎么写
+
+两者关系:
+  先开自动驾驶（generate）
+  → 搞不定 → 切手动（Agent + Skill）
+  → Agent 按教材（SKILL.md）操作工具（CLI commands）完成任务
+```
+
+### 7.2 Skill 与 CLI 的架构关系
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Skill (SKILL.md)                     │
+│           Agent 的操作手册 — 教 Agent 怎么做              │
+│                                                          │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ 决策树       │  │ 常见陷阱      │  │ 模板库         │  │
+│  │ 选认证策略   │  │ 避免踩坑      │  │ Tier 1~5 模板  │  │
+│  └──────┬──────┘  └──────┬───────┘  └───────┬────────┘  │
+│         │               │                   │            │
+│         ▼               ▼                   ▼            │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │              CLI Commands (工具层)                 │   │
+│  │  opencli browser open/network/click/eval/state   │   │
+│  │  opencli generate/explore/cascade/synthesize     │   │
+│  │  opencli list/validate/doctor                    │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Skill 不执行代码**。它是纯 Markdown 文档，Agent 读取后按其中的指引调用 CLI 命令。Skill 本身没有运行时，所有运行时能力都来自 CLI。
+
+### 7.3 Skill 全景
+
+| Skill | 定位 | 与 CLI 的关系 |
+|-------|------|-------------|
+| `opencli-explorer` | 从零开发新站点适配器 | CLI `generate` 的降级兜底方案 |
+| `opencli-oneshot` | 单个 URL 快速生成一个命令 | CLI `generate` 的轻量替代 |
+| `opencli-autofix` | 命令失败时自动修复 | 驱动 Self-Repair Harness（5.3） |
+| `opencli-browser` | 浏览器自动化操作 | 教 Agent 用 `opencli browser` 系列命令 |
+| `opencli-usage` | 日常使用已有命令 | 教 Agent 用已注册的 87+ 适配器 |
+| `smart-search` | 搜索路由器 | 根据搜索意图选择合适的 opencli 命令 |
+
+### 7.4 重点：opencli-explorer Skill
+
+**文件结构**:
+
+```
+skills/opencli-explorer/
+  ├── SKILL.md                          ← 主文档（11.4KB）
+  └── references/
+      ├── adapter-templates.md          ← Tier 1~5 完整适配器模板（13.5KB）
+      ├── advanced-patterns.md          ← 级联请求、tap 调试、抗变更（8.5KB）
+      └── record-workflow.md            ← 手动录制方案（4.6KB）
+```
+
+总计 ~38KB 的 Agent 操作知识。
+
+#### 路径选择器 — 先试 CLI，失败再走 Skill
+
+SKILL.md 开头就引导 Agent 判断该走哪条路：
+
+| 情况 | 走这里 |
+|------|--------|
+| 只要为一个具体页面生成一个命令 | `opencli-oneshot` skill |
+| 想先让机器自动试一遍 | **`opencli generate`，失败再回来** |
+| 新站点 / 多个命令 / oneshot 卡住了 | 继续读 explorer |
+| 产物要提 PR | explorer + `clis/<site>/` + `npm run build` |
+
+**Skill 明确把 CLI 作为第一选择**。
+
+#### 5 步流程
+
+```
+Step 1: 发现 API ──── Agent 用 opencli browser 命令主动探索
+  │   opencli browser open <url>
+  │   opencli browser state           → 查看可交互元素
+  │   opencli browser network         → 抓包看 JSON API
+  │   opencli browser click <N>       → 点击触发懒加载 API
+  │   opencli browser network         → 二次抓包
+  │   opencli browser network --detail <N>  → 查看完整响应体
+  │   opencli browser eval "fetch(...)"     → 验证 API 可复现
+  │
+Step 2: 选择策略 ──── 6 级 Tier 决策树
+  │   Tier 1: public    → fetch 直接拿到
+  │   Tier 2: cookie    → credentials:'include'
+  │   Tier 2.5: localStorage Bearer → JWT 存 localStorage
+  │   Tier 3: header    → CSRF token / Bearer
+  │   Tier 4: intercept → Pinia Store Action + XHR 拦截
+  │   Tier 5: ui        → 纯 DOM 解析（最后手段）
+  │
+Step 2.5: 准备 ───── 复用现有适配器
+  │   "先 ls clis/<site>/，找最相似的那个"
+  │   "改 3 处: name、API URL、字段映射"
+  │
+Step 3: 写适配器 ──── 用 cli() API 写 TypeScript
+  │   Skill 提供 Tier 1~5 的完整模板
+  │   支持 func()、pipeline、分页、级联请求
+  │
+Step 4: 测试 ──────── npm run build + opencli <site> <cmd> --limit 3
+  │
+Step 5: 提交 ──────── git add + commit + push
+```
+
+#### 与 CLI `generate` 的对比
+
+| 维度 | CLI `generate` | Skill `opencli-explorer` |
+|------|:---:|:---:|
+| 执行者 | CLI 自己（确定性代码） | Agent（读 Skill 后操作 CLI） |
+| 公开 JSON API | 能 | 能 |
+| Cookie 认证 | 能 | 能 |
+| CSRF Token (Twitter) | 不能 | 能 — Tier 3 模板 |
+| 签名加密（小红书 X-s/X-t） | 不能 | 能 — Tier 4 intercept + Pinia |
+| UI 自动化 | 不能 | 能 — Tier 5 DOM 解析 |
+| localStorage Bearer (Notion) | 不能 | 能 — Tier 2.5 模板 |
+| 同站点多个命令 | 不能（单个最佳候选） | 能 — Agent 逐个写 |
+| 级联请求 | 不能 | 能 — advanced-patterns.md |
+| 分页/无限滚动 | 不能 | 能 — adapter-templates.md |
+| wbi 签名（B 站） | 不能 | 能 — `apiGet(page, path, {signed})` |
+| 风控伪 200 处理 | 不能 | 能 — 常见陷阱表 |
+| SPA 返回 HTML 诊断 | 不能 | 能 — "搜 JS bundle 找 baseURL" |
+
+#### 具体例子：小红书搜索适配器（CLI 搞不定，Skill 能搞定）
+
+```bash
+# 第一步：先试 CLI
+opencli generate https://www.xiaohongshu.com --goal "search"
+# → blocked: auth-too-complex（小红书需要 X-s/X-t 签名）
+# CLI 到此为止 ❌
+
+# 第二步：Agent 按 Skill 手动做
+opencli browser open https://www.xiaohongshu.com/search_result?keyword=咖啡
+opencli browser network
+#   [0] GET 200 /api/sns/web/v1/search/notes?keyword=咖啡&...
+#   → 请求头含 X-s、X-t（签名）
+opencli browser network --detail 0
+#   → { code: 0, data: { items: [...], has_more: true } }
+
+# Agent 判断：Tier 4 intercept — 需要 Pinia Store Action 绕过签名
+# Agent 按 adapter-templates.md 的 Tier 4 模板写适配器:
+```
+
+```typescript
+// Agent 生成的适配器（CLI generate 无法生成此类代码）
+cli({
+  site: 'xiaohongshu',
+  name: 'search',
+  strategy: Strategy.COOKIE,
+  browser: true,
+  args: [{ name: 'keyword', required: true }],
+  func: async (page, kwargs) => {
+    await page.goto(`https://www.xiaohongshu.com/search_result?keyword=${kwargs.keyword}`);
+    // Pinia Store Action 自动处理 X-s/X-t 签名
+    const data = await page.evaluate(`(async () => {
+      const res = await fetch('/api/sns/web/v1/search/notes?keyword=${kwargs.keyword}', {
+        credentials: 'include'
+      });
+      return (await res.json()).data?.items || [];
+    })()`);
+    return data.slice(0, kwargs.limit);
+  },
+});
+```
+
+**关键区别**: CLI `generate` 只能生成 pipeline（声明式），Skill 教 Agent 写 `func()`（编程式）— 后者能处理签名、分页、条件逻辑等复杂场景。
+
+#### 常见陷阱表（Skill 独有的知识）
+
+| 陷阱 | 表现 | 解决方案 |
+|------|------|---------|
+| 风控伪 200 | JSON 里核心数据是空串 | 断言！`throw new AuthRequiredError()` |
+| SPA 返回 HTML | `fetch('/api/xxx')` 返回 `<!DOCTYPE html>` | API 在 `api.xxx.com`，搜 JS bundle 找 baseURL |
+| 400 缺少上下文 Header | 带了 Bearer 仍然 400 | 先调 `/servers` 拿业务上下文 ID |
+| `__INITIAL_STATE__` 不够 | 只有首屏数据 | `__INITIAL_STATE__` 只有首屏，深层要调 API |
+| evaluate 格式错误 | `result is not a function` | 必须用 IIFE：`(async () => { ... })()` |
+
+这些知识无法编码为确定性规则（因为每个网站的风控和签名方式不同），只能以"经验文档"形式传授给 Agent。
+
+---
+
+## 八、Harness 理念的统一框架
 
 ### 7.1 核心设计原则
 
@@ -1852,7 +2058,7 @@ Self-Repair (5.3)
 
 ---
 
-## 八、值得借鉴的点
+## 九、值得借鉴的点
 
 1. **结构化错误 + 可操作提示**: 每个错误类型都携带 `code`（机器读）、`hint`（人读修复建议）、`exitCode`（Unix 规范），使 AI Agent 和人类都能高效处理错误
 2. **Diagnostic as API**: 将诊断信息视为给 AI Agent 的 API 契约（`RepairContext`），而非给人看的日志
@@ -1869,7 +2075,7 @@ Self-Repair (5.3)
 
 ---
 
-## 九、局限性
+## 十、局限性
 
 1. 浏览器适配器强依赖 Chrome 和 Browser Bridge 扩展，不支持 Firefox/Safari
 2. Pipeline 引擎不支持并行步骤或条件分支
