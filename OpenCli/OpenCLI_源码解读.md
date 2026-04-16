@@ -245,6 +245,30 @@ Agent 执行 opencli <site> <command>
 
 **实现**: `src/generate-verified.ts`
 
+#### 纯 CLI 流程，零 Agent 依赖
+
+整个 Verified Generation Harness **完全通过 CLI 命令完成**，不需要 AI Agent 参与。`src/cli.ts` 中定义了三个核心命令：
+
+```bash
+# 一键完成全流程: explore → synthesize → verify → register
+opencli generate <url> --goal <text> --site <name>
+
+# 也可以分步执行：
+opencli explore <url>              # 第 1 步：浏览器探索，输出 JSON artifacts
+opencli synthesize <site>          # 第 2 步：从 explore 结果合成候选适配器
+opencli cascade <url> --pipeline <file>  # 第 3 步：策略探测
+```
+
+`opencli generate` 是上述步骤的编排器（`generateVerifiedFromUrl()`），在单个 CLI 调用中串联所有阶段。整个流程是**纯 TypeScript 代码**，运行时零 LLM 消耗：
+
+- Explore: 浏览器网络拦截 + 确定性规则分析（见 4.3.1）
+- Synthesize: 基于模板的 YAML 生成
+- Cascade: HTTP 请求逐级探测
+- Verify: 执行 pipeline + `assessResult()` 质量评估
+- Repair: 替换 `itemPath` 后重试（最多 1 次）
+
+Agent 的角色是**可选的**：仅在需要自修复（Self-Repair，见 4.2）或自动化研究（AutoResearch，见 4.5）时才介入。
+
 **Pipeline**:
 
 ```
@@ -284,6 +308,117 @@ Phase 6: Persist
 | `blocked` | 无法继续 | `not-reusable` |
 
 **Early Hint 机制**: 在 explore/synthesize/cascade 每个阶段通过 `onEarlyHint` 回调提前通知调用方，实现成本门控（不适合的 URL 尽早退出，减少不必要的浏览器会话开销）。
+
+#### 4.3.1 Explore 机制详解（9 步确定性流程）
+
+Explore 是 Verified Generation 的第一阶段，负责从目标网页自动发现 API endpoints 和能力。整个实现位于 `src/explore.ts`（516 行）+ `src/analysis.ts`（180 行），**不依赖任何 LLM**，完全基于确定性规则。
+
+**9 步探索流程**:
+
+```
+Step 1: Navigate + Network Capture
+  → page.startNetworkCapture()  // 开始拦截网络请求
+  → page.goto(url)               // 导航到目标 URL
+  → page.wait(waitSeconds)        // 等待页面初始加载
+
+Step 2: Auto-Scroll (懒加载触发)
+  → page.autoScroll({ times: 3, delayMs: 1500 })
+  → 滚动 3 次，每次间隔 1.5s，触发所有 lazy-loading 和无限滚动
+
+Step 2.5: Interactive Fuzzing (仅 --auto 模式)
+  → page.evaluate(INTERACT_FUZZ_JS)
+  → 详见 4.3.2 自动点击行为
+
+Step 3: Metadata Extraction
+  → 从 document.title, meta[name=description] 等提取页面元数据
+
+Step 4: Network Harvest
+  → page.readNetworkCapture() ?? page.networkRequests(false)
+  → 收集所有网络请求（URL, method, status, headers, responseBody）
+
+Step 5: iframe Re-Fetch (补全缺失的 JSON body)
+  → 对响应体为空但 Content-Type 为 JSON 的请求，通过 iframe.contentWindow.fetch 重新请求
+  → 使用 iframe 而非直接 fetch，是为了绕过 SPA 框架对 window.fetch 的 monkey-patching
+
+Step 6: Framework Detection
+  → page.evaluate(FRAMEWORK_DETECT_JS)
+  → 通过 DOM/window 标记检测前端框架:
+    __vue__         → Vue 2
+    __vue_app__     → Vue 3
+    __REACT_DEVTOOLS_GLOBAL_HOOK__ → React
+    __NEXT_DATA__   → Next.js
+    __NUXT__        → Nuxt
+    $pinia          → Pinia
+    $store          → Vuex
+
+Step 7: Endpoint Analysis (确定性规则引擎)
+  → analyzeEndpoints(networkEntries) — src/analysis.ts
+  → 包含以下子步骤:
+    a. isNoiseUrl(): 过滤追踪/分析类 URL (google analytics, sentry, etc.)
+    b. urlToPattern(): URL 模式化 (数字→{id}, 16进制→{hex}, BV号→{bvid})
+    c. findArrayPath(): 在 JSON 响应中递归查找最大对象数组 (最深 5 层)
+    d. detectFieldRoles(): 字段名→语义角色映射 (title/name→title, img/avatar→image, etc.)
+    e. classifyQueryParams(): 参数分类 (keyword→search, page/offset→pagination, limit→limit)
+    f. detectAuthFromHeaders(): 从请求头检测认证方式 (bearer/csrf/signature)
+
+Step 8: Capability Inference
+  → inferCapabilitiesFromEndpoints(analyzed, stores, opts)
+  → 从 URL 关键词推导 CLI 能力名称:
+    hot/popular/trending → hot
+    search/query → search
+    recommend → recommend
+    detail/info → detail
+    ...
+
+Step 9: Write Artifacts (5 个 JSON 文件)
+  → writeExploreArtifacts(targetDir, result, analyzed, stores)
+  → 输出到 .opencli/explore/<site>/:
+    manifest.json     — 页面元数据 + 框架信息
+    endpoints.json    — 所有发现的 API endpoint 及其分析结果
+    capabilities.json — 推导出的 CLI 能力列表
+    auth.json         — 检测到的认证方式
+    stores.json       — 发现的数据存储 (localStorage/cookie 等)
+```
+
+**设计要点**:
+- 整个 Explore 过程是**一次性的浏览器会话**，从打开页面到写入 JSON 文件一气呵成
+- 所有分析规则都是**硬编码的确定性规则**（正则 + 关键词映射），不依赖 LLM
+- iframe re-fetch 是一个精巧的设计：SPA 应用通常会 monkey-patch `window.fetch`，但 iframe 中的 `contentWindow.fetch` 是原生的，能拿到真实的响应体
+
+#### 4.3.2 自动点击行为与安全约束
+
+Explore 阶段对页面元素的点击操作**默认关闭**，仅在显式指定选项时启用。共有三种模式：
+
+**模式一：默认模式（仅滚动）**
+```bash
+opencli explore <url>
+```
+- 只执行 `autoScroll`（3 次滚动）
+- **不点击任何元素**
+- 适合大多数 SPA 页面，滚动即可触发 lazy-loading API 请求
+
+**模式二：`--auto` 盲目模糊点击**
+```bash
+opencli explore <url> --auto
+```
+- 执行 `INTERACT_FUZZ_JS` 脚本（`src/scripts/interact.ts`）
+- 选择器范围: `button, [role="button"], [role="tab"], .tab, .btn, a[href="javascript:void(0)"], a[href="#"]`
+- **安全约束**:
+  - 最多点击 **15 个元素**（`.slice(0, 15)`）
+  - 每次点击间隔 **300ms**（`await sleep(300)`）
+  - 只点击**可见元素**（`rect.width > 0 && rect.height > 0`）
+  - 只点击不会导航离开页面的元素（`a[href="javascript:void(0)"]` 和 `a[href="#"]`，排除真实链接）
+  - 使用 `dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))` 而非 `el.click()`，给页面框架处理冒泡的机会
+
+**模式三：`--click` 精确标签点击**
+```bash
+opencli explore <url> --click "热门,推荐,排行"
+```
+- 根据提供的标签文本，精确定位并点击匹配的 Tab/Button
+- 在盲目 fuzzing 之前执行
+- 适合需要切换特定 Tab 才能触发 API 的场景
+
+**点击的目的**: 不是为了"浏览页面"，而是为了**触发更多 API 请求**。许多 SPA 页面的数据接口只有在点击特定 Tab 或按钮后才会被调用。通过有限度的点击，Explore 能发现更多隐藏的 API endpoints。
 
 ### 4.4 理念四：Strategy Cascade Harness（策略级联线束）
 
