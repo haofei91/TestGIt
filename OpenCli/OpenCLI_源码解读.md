@@ -1511,6 +1511,49 @@ it('all expected sites are registered', async () => {
 | 站点不稳定容忍 | E2E 中 warn + pass（不阻断 CI） |
 | 瞬态重试 | `isTransientBrowserDetach()` 检测到断连后自动重试一次 |
 
+#### 感知 → 触发 → 执行 → 反馈：完整链路
+
+测试不是 OpenCLI 自己感知和运行的 — 整个流程由 **GitHub 平台** 通过 Webhook + GitHub Actions 机制驱动：
+
+**第一步：感知** — 开发者 `git push` 到 GitHub，GitHub 服务器收到事件后扫描仓库根目录的 `.github/workflows/*.yml`。
+
+**第二步：匹配** — 逐个检查每个 workflow 的 `on:` 触发条件：
+
+```yaml
+# ci.yml — 检查 on.pull_request.branches
+on:
+  pull_request:
+    branches: [main, dev]    # ← PR 目标是 main → 匹配 ✓
+
+# e2e-headed.yml — 还要检查 paths
+on:
+  pull_request:
+    branches: [main, dev]    # ← PR 目标是 main → 匹配 ✓
+    paths:
+      - 'src/browser/**'     # ← 改了 dom-snapshot.ts → 匹配 ✓
+      # 如果 PR 只改了 README.md，paths 不匹配 → E2E 不触发
+```
+
+**第三步：执行** — GitHub 从 Runner 池分配云端虚拟机（ubuntu/macOS/Windows），每台 VM 全新隔离，从克隆代码开始到测试完成后销毁：
+
+```
+ci.yml 分配的 VM（并行）:
+  VM 1-3 (ubuntu/macos/windows) ── build: tsc --noEmit + npm run build
+  VM 4-5 (ubuntu)               ── unit-test: vitest --shard=1/2 + 2/2
+  VM 6 (ubuntu)                 ── adapter-test: npm run test:adapter
+  VM 7 (ubuntu)                 ── bun-test: bun vitest run
+
+e2e-headed.yml 分配的 VM（并行）:
+  VM 8 (ubuntu) ── Setup Chrome → xvfb-run vitest run tests/e2e/
+  VM 9 (macos)  ── Setup Chrome → vitest run tests/e2e/
+```
+
+**第四步：反馈** — 每个 job 执行完毕后结果回写到 PR 页面的 Checks 面板，如设置了 branch protection rule 则所有 required checks 通过才允许 Merge。
+
+```
+时间线: 开发者 git push → GitHub 感知 → 匹配 yml 规则 → 分配 VM → 执行测试 → 结果回写 PR
+```
+
 #### Testing Harness 与其他 Harness 的配合
 
 ```
