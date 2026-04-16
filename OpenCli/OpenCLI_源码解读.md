@@ -1045,40 +1045,154 @@ opencli doctor --verify # 运行静态校验 + smoke test
 
 **核心思想**: 借鉴 Karpathy 的 autoresearch 理念 — 用 **约束（scope） + 机械度量（verify） + 无限循环（iteration）** 驱动 AI 自动改进代码。
 
-**实现**: `autoresearch/engine.ts` + `autoresearch/config.ts`
+**实现**: `autoresearch/engine.ts`（363 行）+ `autoresearch/config.ts`（82 行）+ `autoresearch/commands/run.ts`（入口）
 
-**8 阶段迭代循环**:
+#### 谁在什么时候触发？
+
+**AutoResearch 不是终端用户功能，不会被自动触发。** 它是给 OpenCLI **开发者/维护者**用来系统性改进框架自身代码的工具。
+
+触发方式是开发者手动运行命令：
+
+```bash
+# 方式一：使用预置配置
+npx tsx autoresearch/commands/run.ts --preset browser-reliability
+npx tsx autoresearch/commands/run.ts --preset browser-reliability --iterations 5
+
+# 方式二：自定义配置
+npx tsx autoresearch/commands/run.ts --goal "..." --verify "..." --scope "src/*.ts" --iterations 10
+```
+
+#### 具体触发场景
+
+| 场景 | 预置配置 | 目标 |
+|------|---------|------|
+| 浏览器命令可靠性不够 | `browser-reliability` | 59 个浏览器命令测试通过率 → 100% |
+| Skill 质量不达标 | `skill-quality` | 提升 Skill 质量评分 |
+| V2EX 适配器不稳定 | `v2ex-reliability` | 提升 V2EX 适配器可靠性 |
+| 知乎适配器不稳定 | `zhihu-reliability` | 提升知乎适配器可靠性 |
+| 保存功能不可靠 | `save-reliability` | 提升保存功能可靠性 |
+| 综合改进 | `combined` | 多维度综合可靠性提升 |
+| 自定义任意模块优化 | 无（通过 CLI 参数） | 开发者自定义 goal/scope/verify |
+
+#### Engine 与 Agent 的分工
+
+`Engine` 类本身只是一个**循环管理器**，真正做代码修改的是传入的 `modify` 回调。在 `commands/run.ts` 中，这个回调的实现是调用 Claude Code：
+
+```typescript
+// commands/run.ts:63 — modify 回调 = 调用 AI Agent
+const result = execSync(
+  `claude -p --dangerously-skip-permissions \
+    --allowedTools "Bash(npm:*),Bash(npx:*),Bash(git:*),Read,Edit,Write,Glob,Grep" \
+    --output-format text "${prompt}"`,
+  { cwd: ROOT, timeout: 300_000 }
+);
+```
+
+**分工关系**:
+
+```
+Engine (循环骨架)                     modify 回调 (AI Agent)
+──────────────────                    ────────────────────────
+Phase 0: 前置检查                      
+Phase 1: 收集上下文 ──传递──→          Phase 2-3: 读代码 → 构思 → 改代码
+                    ←──返回──          返回一句话描述
+Phase 4: git commit                    
+Phase 5: 运行 verify 命令              
+Phase 5.5: 运行 guard 命令             
+Phase 6: keep / discard (回滚)         
+Phase 7: 写 TSV 日志                   
+Phase 8: 回到 Phase 1                  
+```
+
+Engine 通过 `ModifyContext` 向 Agent 传递当前状态：
+
+```typescript
+interface ModifyContext {
+  iteration: number;          // 当前迭代轮次
+  bestMetric: number;         // 历史最佳度量
+  currentMetric: number;      // 当前度量
+  recentLog: IterationResult[]; // 最近 20 条迭代记录
+  gitLog: string;             // 最近 20 条 git log
+  scopeFiles: string[];       // 允许修改的文件列表
+  consecutiveDiscards: number; // 连续丢弃次数
+  stuckHint: string | null;   // 卡住提示（连续丢弃 > 5 时）
+}
+```
+
+#### 8 阶段迭代循环
 
 ```
 Phase 0: Precondition — git clean, 无锁, 非 detached HEAD
 Phase 1: Review     — 读取 scope 文件 + 日志 + git 历史
-Phase 2: Ideate     — 选择下一个变更方向
-Phase 3: Modify     — 一次原子变更（委托给回调）
+Phase 2: Ideate     — 选择下一个变更方向（Agent 内部）
+Phase 3: Modify     — 一次原子变更（委托给 modify 回调/Agent）
 Phase 4: Commit     — git add + commit（仅 scope 内文件）
 Phase 5: Verify     — 运行验证命令，提取度量值
 Phase 5.5: Guard    — 可选回归检查（如 npm run build）
-Phase 6: Decide     — keep（度量改善且通过 guard）/ discard（回滚）/ crash
-Phase 7: Log        — TSV 日志记录
+Phase 6: Decide     — keep（度量改善且通过 guard）/ discard（git revert 回滚）/ crash
+Phase 7: Log        — TSV 日志追加记录
 Phase 8: Repeat     — 回到 Phase 1
 ```
 
-**Preset 示例** (browser-reliability):
+**度量值提取** (`extractMetric`): 从 verify 命令输出的最后几行中提取数值，支持 `SCORE=56` 格式或纯数字行。
+
+**迭代上限**: `maxIter = config.iterations ?? Infinity` — 未指定时默认无限迭代。
+
+**Baseline 测量**: 迭代 0 在主循环前运行 verify 命令，建立基准度量值。
+
+#### Preset 示例 (browser-reliability)
 
 ```typescript
-{
+// autoresearch/presets/browser-reliability.ts
+export const browserReliability: AutoResearchConfig = {
   goal: 'Increase browser command pass rate to 59/59 (100%)',
-  scope: ['src/browser/dom-snapshot.ts', 'src/browser/dom-helpers.ts', ...],
+  scope: [
+    'src/browser/dom-snapshot.ts',
+    'src/browser/dom-helpers.ts',
+    'src/browser/base-page.ts',
+    'src/browser/page.ts',
+    'src/cli.ts',
+  ],
   metric: 'pass_count',
   direction: 'higher',
   verify: 'npx tsx autoresearch/eval-browse.ts 2>&1 | tail -1',
   guard: 'npm run build',
   minDelta: 1,
-}
+};
 ```
 
-**卡住检测**: 当连续丢弃次数 > 5 时，提供递进式提示：重读 scope → 组合成功策略 → 反向思考 → 激进架构变更 → 简化。
+#### 决策逻辑与安全机制
 
-**与 Self-Repair 的区别**: Self-Repair 是"命令失败时的应急修复"（被动触发、最多 3 轮、修改单个适配器）；AutoResearch 是"主动的系统性改进"（主动触发、无限迭代、可修改 scope 内任何文件）。
+**keep/discard 判定**:
+```
+度量改善 AND |delta| >= minDelta AND guard 通过 → keep（保留 commit）
+度量改善但 guard 失败 → discard（git revert）
+度量未改善 → discard（git revert）
+```
+
+**Commit 作用域约束**: `git add` 仅暂存 `config.scope` 匹配的文件，防止 Agent 越界修改。
+
+**Hook 被拒处理**: 如果 `git commit` 被 pre-commit hook 拒绝，记录 `hook-blocked` 状态，不回滚，继续下一轮。
+
+**卡住检测**: 当连续丢弃次数 > 5 时，提供递进式提示：
+1. 重读所有 scope 文件，尝试完全不同的方法
+2. 回顾历史日志，组合之前成功的策略
+3. 尝试之前失败方向的**反面**
+4. 激进的架构变更而非增量调整
+5. 简化 — 减少复杂度而非增加
+
+#### 与 Self-Repair 的本质区别
+
+| 维度 | Self-Repair | AutoResearch |
+|------|------------|-------------|
+| 触发方式 | 被动 — 命令运行失败时 | 主动 — 开发者手动启动 |
+| 使用者 | AI Agent（帮终端用户修复适配器） | OpenCLI 开发者（改进框架自身） |
+| 目标 | 修复单个适配器让命令能跑通 | 系统性提升代码质量指标 |
+| 迭代次数 | 最多 3 轮 | 无限（`Infinity`） |
+| 修改范围 | 仅 `adapter.sourcePath` | `scope` 内任意文件 |
+| 度量方式 | 命令是否执行成功 | 自定义 verify 命令输出的数值 |
+| Agent 角色 | 读诊断 → 改适配器 → 重试 | 读上下文 → 构思 → 原子修改 |
+| 回滚机制 | 无（修改就保留） | `git revert`（度量未改善就回滚） |
 
 ### 6.2 Testing Harness（测试线束）
 
