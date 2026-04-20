@@ -110,7 +110,37 @@ Android 设备
 
 ---
 
-## 四、后续备选方案
+## 四、手机上为什么装了 3 个 APK？文档里没提过
+
+### 这 3 个 APK 是什么
+
+| APK 包名 | 作用 |
+|---------|------|
+| `io.appium.settings` | 修改设备系统设置（如关闭动画、调整权限） |
+| `io.appium.uiautomator2.server` | 在手机上跑一个 HTTP 服务，接收电脑发来的控制指令（**核心**） |
+| `io.appium.uiautomator2.server.test` | 启动上面那个服务的「发射器」（Instrumentation Runner） |
+
+### 为什么要装？
+
+这 3 个 APK 是 **Appium UIAutomator2 Driver 的基础设施**，不是 appium-mcp 特有的。`uiautomator2.server` 必须运行在设备上，Appium 才能向手机发送控制指令——这是 UIAutomator2 的工作原理，无法绕过。
+
+正常情况下，Appium 在第一次建立会话时**会自动帮你安装**，用户完全不需要感知。我们之所以要手动装，是因为 Android 13 拒绝了 Appium 自动安装时使用的 `-g`（自动授权所有权限）参数，导致自动安装失败，不得不手动执行。
+
+### 为什么文档里没提？
+
+用户分享的 appium-mcp 快速上手文档可能基于以下假设编写：
+
+1. **面向模拟器**：模拟器对权限限制宽松，Appium 能自动安装，用户无感
+2. **面向低版本 Android（≤12）**：Android 13 才收紧了 `-g` 安装权限
+3. **假设设备已跑通过 Appium**：APK 之前已安装过，无需重复操作
+
+### 教训
+
+在开始前应先对照文档核实前置条件（设备类型、Android 版本），而不是直接套标准 Appium 完整流程。Android 13 真机 + 生产版 App 是最难的场景组合，而快速上手文档通常针对「最顺」的场景编写。
+
+---
+
+## 五、后续备选方案
 
 如果仍需实现自动点击招行 App WebView 内元素，可考虑：
 
